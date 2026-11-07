@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.3 PWA 摺疊版</title>
+  <title>Web 對講機 - v10.4 PWA 摺疊版</title>
   
   <!-- PWA Manifest 內嵌支援 -->
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
@@ -230,7 +230,7 @@
 </head>
 <body>
 
-  <div class="ver">v10.3 PWA 摺疊版</div>
+  <div class="ver">v10.4 PWA 摺疊版</div>
   
   <!-- 預設摺疊：狀態燈號 -->
   <details>
@@ -280,9 +280,10 @@
     const MY_ID = Math.floor(Math.random() * 0xFFFFFFFF) >>> 0;
     const MY_ID_HEX = MY_ID.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
 
-    // 偵測係咪 iPhone / iPad：因為 iOS WebKit 一開 SpeechRecognition 就會將傳聲 Stream 靜音
-    const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || 
-                   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    // 偵測係咪舊款 iOS (iOS 15 或以下)，或者一般 iOS
+    const iosVerMatch = navigator.userAgent.match(/OS (\d+)_/);
+    const IOS_VER = iosVerMatch ? parseInt(iosVerMatch[1], 10) : 0;
+    const IS_OLD_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) && IOS_VER > 0 && IOS_VER <= 15;
 
     let client = null;
     let audioCtx = null;
@@ -299,16 +300,13 @@
     let rxCount = 0;
     let rxTimeout = null;
 
-    // 紀錄當前收聽緊邊部機講嘢（如果對方係舊 iPhone 無開本機聽寫，接收端可順手代轉字幕）
-    let activeRemoteSpeaker = null;
-    let remoteHasSentText = false;
-
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     let recognition = null;
-    let sttEnabled = true;
-    let sttRunning = false;
+    // 舊 iPhone (iOS <= 15) 預設關閉本機發話時嘅 SpeechRecognition 免得搶走個咪令對方聽唔到聲，但照樣睇到對面字幕！
+    // 新 iPhone / Android / PC 預設開啟字幕，一撳 PTT 即時邊講邊出字！
+    let sttEnabled = !IS_OLD_IOS;
     let currentTranscript = "";
-    let sttTargetSender = MY_ID_HEX;
+    let finalizedTranscript = "";
 
     const initBtn = document.getElementById('initBtn');
     const pttBtn = document.getElementById('pttBtn');
@@ -355,6 +353,20 @@
     }
     updateDebug();
 
+    function syncSttButtonUI() {
+      if (sttEnabled) {
+        toggleSttBtn.innerText = "字幕: 開啟";
+        toggleSttBtn.className = "ctrl-btn stt-on";
+        sttBadge.innerText = "粵語字幕: 就緒";
+        sttBadge.className = "badge ok";
+      } else {
+        toggleSttBtn.innerText = "字幕: 關閉 (保音質)";
+        toggleSttBtn.className = "ctrl-btn";
+        sttBadge.innerText = "粵語字幕: 純看字 (防搶咪)";
+        sttBadge.className = "badge warn";
+      }
+    }
+
     function initSpeechRecognition() {
       if (!SpeechRecognition) {
         sttBadge.innerText = "粵語字幕: 瀏覽器不支援";
@@ -365,22 +377,20 @@
 
       recognition = new SpeechRecognition();
       recognition.lang = 'zh-HK';
-      recognition.continuous = true;
+      // 重要修復：iOS Safari 如果設 continuous = true 好容易卡死完全唔觸發 onresult
+      // 改用 false 並喺 isTalking 期間自動接續，iPhone 同 Android 都秒出字幕！
+      recognition.continuous = false;
       recognition.interimResults = true;
 
       recognition.onstart = () => {
-        sttRunning = true;
         sttBadge.innerText = "粵語字幕: 聽寫中...";
         sttBadge.className = "badge ok";
       };
 
       recognition.onresult = (event) => {
-        // 如果係幫對面舊 iPhone 代聽緊，但對面已經自己有發字幕過嚟，就唔覆蓋
-        if (sttTargetSender !== MY_ID_HEX && remoteHasSentText) return;
-
         let interim = "";
         let finalStr = "";
-        for (let i = 0; i < event.results.length; i++) {
+        for (let i = event.resultIndex; i < event.results.length; i++) {
           const transcript = event.results[i][0].transcript;
           if (event.results[i].isFinal) {
             finalStr += transcript;
@@ -388,11 +398,13 @@
             interim += transcript;
           }
         }
-        currentTranscript = (finalStr + interim).trim();
+        if (finalStr) {
+          finalizedTranscript += finalStr;
+        }
+        currentTranscript = (finalizedTranscript + interim).trim();
         if (currentTranscript) {
-          const isMe = (sttTargetSender === MY_ID_HEX);
-          upsertChatMessage(sttTargetSender, currentTranscript, false, isMe);
-          publishTextSubtitle(sttTargetSender, currentTranscript, false);
+          upsertChatMessage(MY_ID_HEX, currentTranscript, false, true);
+          publishTextSubtitle(currentTranscript, false);
         }
       };
 
@@ -404,21 +416,21 @@
       };
 
       recognition.onend = () => {
-        sttRunning = false;
-        if (sttEnabled) {
-          sttBadge.innerText = IS_IOS ? "粵語字幕: 就緒 (iOS防搶咪)" : "粵語字幕: 就緒";
-          sttBadge.className = "badge ok";
+        // 如果仲撳緊 PTT 講緊嘢，自動繼續聽寫下一句
+        if (isTalking && sttEnabled) {
+          try { recognition.start(); } catch (e) {}
+        } else {
+          syncSttButtonUI();
         }
       };
 
-      sttBadge.innerText = IS_IOS ? "粵語字幕: 就緒 (iOS防搶咪)" : "粵語字幕: 就緒";
-      sttBadge.className = "badge ok";
+      syncSttButtonUI();
     }
 
-    function publishTextSubtitle(senderHex, text, isFinal) {
+    function publishTextSubtitle(text, isFinal) {
       if (!client || !client.connected || !text) return;
       const payload = JSON.stringify({
-        sender: senderHex,
+        sender: MY_ID_HEX,
         text: text,
         final: isFinal
       });
@@ -451,18 +463,10 @@
 
     toggleSttBtn.onclick = () => {
       sttEnabled = !sttEnabled;
-      if (sttEnabled) {
-        toggleSttBtn.innerText = "字幕: 開啟";
-        toggleSttBtn.className = "ctrl-btn stt-on";
-        sttBadge.innerText = IS_IOS ? "粵語字幕: 就緒 (iOS防搶咪)" : "粵語字幕: 就緒";
-        sttBadge.className = "badge ok";
-      } else {
-        if (recognition && sttRunning) { try { recognition.stop(); } catch (e) {} }
-        toggleSttBtn.innerText = "字幕: 關閉";
-        toggleSttBtn.className = "ctrl-btn";
-        sttBadge.innerText = "粵語字幕: 已關閉";
-        sttBadge.className = "badge off";
+      if (!sttEnabled && recognition) {
+        try { recognition.stop(); } catch (e) {}
       }
+      syncSttButtonUI();
     };
 
     function playRogerBeep(freq = 1250, durationMs = 65) {
@@ -649,46 +653,28 @@
       });
 
       client.on('message', (topic, payload) => {
-        // 1. 收到字幕訊息：無論開關都會即時顯示喺字幕框
         if (topic === currentTextTopic) {
           try {
             const data = JSON.parse(new TextDecoder().decode(payload));
-            if (data.sender && data.text) {
-              if (data.sender !== MY_ID_HEX) {
-                remoteHasSentText = true;
-              }
-              const isMe = (data.sender === MY_ID_HEX);
-              upsertChatMessage(data.sender, data.text, data.final, isMe);
+            if (data.sender && data.sender !== MY_ID_HEX && data.text) {
+              upsertChatMessage(data.sender, data.text, data.final, false);
             }
           } catch (e) {}
           return;
         }
 
-        // 2. 收到語音封包：100% 原裝邏輯
         if (topic !== currentTopic || isTalking || payload.byteLength <= 4) return;
 
         const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
         const senderId = view.getUint32(0, true);
         if (senderId === MY_ID) return;
 
-        const senderHex = senderId.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
         rxCount++;
         updateDebug();
 
-        // 如果係新一段接收（例如舊 iPhone 講緊嘢過嚟），非 iOS 接收端可以順手幫手聽寫出字幕
-        if (activeRemoteSpeaker !== senderHex) {
-          activeRemoteSpeaker = senderHex;
-          remoteHasSentText = false;
-          currentTranscript = "";
-          if (sttEnabled && !IS_IOS && recognition && !sttRunning) {
-            sttTargetSender = senderHex;
-            try { recognition.start(); } catch (e) {}
-          }
-        }
-
         pttBtn.classList.add('receiving');
         pttBtn.innerText = "對方講話中...";
-        statusText.innerText = `正在接收來自 [${senderHex}] 的語音...`;
+        statusText.innerText = `正在接收來自 [${senderId.toString(16).toUpperCase().padStart(8, '0').slice(0, 4)}] 的語音...`;
         clearTimeout(rxTimeout);
         rxTimeout = setTimeout(() => {
           if (!isTalking) {
@@ -696,20 +682,8 @@
             pttBtn.innerText = micEnabled ? "按住通話 (PTT)" : "純收聽模式\n(已關閉麥克風)";
             statusText.innerText = micEnabled ? "已連線！放開收聽，按住通話" : "純收聽模式待命中";
             playRogerBeep(1150, 70);
-
-            if (activeRemoteSpeaker) {
-              if (recognition && sttRunning && sttTargetSender === activeRemoteSpeaker) {
-                try { recognition.stop(); } catch (e) {}
-              }
-              if (currentTranscript && !remoteHasSentText) {
-                upsertChatMessage(activeRemoteSpeaker, currentTranscript, true, false);
-                publishTextSubtitle(activeRemoteSpeaker, currentTranscript, true);
-                currentTranscript = "";
-              }
-              activeRemoteSpeaker = null;
-            }
           }
-        }, 450);
+        }, 350);
 
         playIncomingUlaw(new Uint8Array(payload.buffer, payload.byteOffset + 4, payload.byteLength - 4));
       });
@@ -805,7 +779,7 @@
 
       isTalking = true;
       currentTranscript = "";
-      sttTargetSender = MY_ID_HEX;
+      finalizedTranscript = "";
       pttBtn.classList.remove('receiving');
       pttBtn.classList.add('active');
       pttBtn.innerText = "正在廣播中...";
@@ -814,22 +788,39 @@
       ensureAudioActive();
       playRogerBeep(1500, 45);
 
-      // 核心修復：
-      // 非 iOS 裝置（Android / PC）按住 PTT 照常直接啟動 recognition 出字幕。
-      // iOS 裝置（舊 iPhone）按住 PTT 時絕對唔 call recognition.start()，等語音 100% 傳出去唔會無聲！
-      if (sttEnabled && !IS_IOS && recognition) {
-        try { recognition.start(); } catch (e) {}
-      }
-
       const source = audioCtx.createMediaStreamSource(micStream);
       scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
 
       silencer = audioCtx.createGain();
       silencer.gain.value = 0;
 
+      // 檢測係咪被 iOS SpeechRecognition 搶咗咪（連續收到全 0 靜音 frame）
+      let silentFrames = 0;
+
       scriptNode.onaudioprocess = (e) => {
         if (!isTalking || !client.connected) return;
         const inputData = e.inputBuffer.getChannelData(0);
+
+        // 自動防搶咪保護：如果開住字幕時，發現 iOS 將 micStream 變咗全 0 靜音
+        // 立即自動 stop 咗個 SpeechRecognition 搶返個咪，確保對面電話即刻聽返聲！
+        if (sttEnabled && recognition) {
+          let maxVal = 0;
+          for (let i = 0; i < inputData.length; i += 16) {
+            const v = Math.abs(inputData[i]);
+            if (v > maxVal) maxVal = v;
+          }
+          if (maxVal === 0) {
+            silentFrames++;
+            if (silentFrames >= 4) {
+              sttEnabled = false;
+              try { recognition.abort(); } catch (err) {}
+              syncSttButtonUI();
+            }
+          } else {
+            silentFrames = 0;
+          }
+        }
+
         const packet = encodeAudioPacket(inputData, audioCtx.sampleRate);
         client.publish(currentTopic, packet, { qos: 0 });
 
@@ -840,6 +831,10 @@
       source.connect(scriptNode);
       scriptNode.connect(silencer);
       silencer.connect(audioCtx.destination);
+
+      if (sttEnabled && recognition) {
+        try { recognition.start(); } catch (e) {}
+      }
     }
 
     function stopTalking() {
@@ -858,13 +853,14 @@
         silencer = null;
       }
 
-      if (recognition && sttRunning) {
+      if (recognition) {
         try { recognition.stop(); } catch (e) {}
       }
       if (currentTranscript) {
         upsertChatMessage(MY_ID_HEX, currentTranscript, true, true);
-        publishTextSubtitle(MY_ID_HEX, currentTranscript, true);
+        publishTextSubtitle(currentTranscript, true);
         currentTranscript = "";
+        finalizedTranscript = "";
       }
 
       playRogerBeep(1050, 60);
