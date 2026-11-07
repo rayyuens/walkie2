@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.1 PWA 摺疊版</title>
+  <title>Web 對講機 - v10.1 PWA 摺疊加密版</title>
   
   <!-- PWA Manifest 內嵌支援 -->
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
@@ -124,13 +124,13 @@
       color: #84ffff;
       background: rgba(0, 229, 255, 0.1);
     }
-    /* 音量控制拉尺樣式 */
-    .vol-row {
+    /* 密碼輸入框與音量控制拉尺樣式 */
+    .pwd-row, .vol-row {
       width: 100%;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 10px;
+      gap: 8px;
       background: #1c2026;
       border: 1px solid #37474f;
       padding: 7px 12px;
@@ -139,6 +139,21 @@
       font-weight: 600;
       color: #eceff1;
       box-sizing: border-box;
+    }
+    .pwd-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: #00e5ff;
+      font-size: 13px;
+      font-family: monospace;
+      outline: none;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    .pwd-input::placeholder {
+      color: #78909c;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     .vol-row input[type="range"] {
       flex: 1;
@@ -258,7 +273,7 @@
 </head>
 <body>
 
-  <div class="ver">v10.1 PWA 摺疊版</div>
+  <div class="ver">v10.1 PWA 摺疊版 (帶加密及音量控制)</div>
   
   <!-- 預設摺疊：狀態燈號 -->
   <details>
@@ -268,6 +283,7 @@
       <div class="badge" id="netBadge">網絡: 待命</div>
       <div class="badge" id="micBadge">麥克風: 未授權</div>
       <div class="badge" id="sttBadge">粵語字幕: 待命</div>
+      <div class="badge warn" id="secBadge">加密: 公開模式</div>
     </div>
   </details>
 
@@ -283,7 +299,13 @@
       </select>
       <button class="ctrl-btn mic-on" id="toggleMicBtn">停止麥克風</button>
       <button class="ctrl-btn stt-on" id="toggleSttBtn">字幕: 開啟</button>
-      
+
+      <!-- 新增：頻道加密密碼輸入框 -->
+      <div class="pwd-row">
+        <span>🔑 密碼</span>
+        <input type="password" id="channelPasswordInput" class="pwd-input" placeholder="輸入相同密碼即可加密通話 (留空為公開)">
+      </div>
+
       <!-- 新增：接收音量控制 Bar -->
       <div class="vol-row">
         <span>🔊 音量</span>
@@ -297,7 +319,7 @@
   <button id="initBtn">啟用全天候對講機</button>
   <button id="pttBtn">按住通話 (PTT)</button>
 
-  <!-- 廣東話即時對話字幕框 -->
+  <!-- 廣東話即時字幕紀錄區 -->
   <div class="chat-box" id="chatBox">
     <div class="chat-msg" style="color:#607d8b; text-align:center; font-size:12px;">
       --- 廣東話即時對話字幕 (按住 PTT 講話自動辨識) ---
@@ -332,6 +354,9 @@
     let rxCount = 0;
     let rxTimeout = null;
 
+    // 端對端 AES-GCM 加密金鑰
+    let cryptoKey = null;
+
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     let recognition = null;
     let sttEnabled = true;
@@ -345,13 +370,101 @@
     const netBadge = document.getElementById('netBadge');
     const micBadge = document.getElementById('micBadge');
     const sttBadge = document.getElementById('sttBadge');
+    const secBadge = document.getElementById('secBadge');
     const controlsDetails = document.getElementById('controlsDetails');
     const channelSelect = document.getElementById('channelSelect');
     const toggleMicBtn = document.getElementById('toggleMicBtn');
     const toggleSttBtn = document.getElementById('toggleSttBtn');
+    const channelPasswordInput = document.getElementById('channelPasswordInput');
     const volSlider = document.getElementById('volSlider');
     const volValue = document.getElementById('volValue');
     const chatBox = document.getElementById('chatBox');
+
+    // ==========================================
+    // 端對端 AES-GCM 加密與解密函數
+    // ==========================================
+    async function setChannelPassword(password) {
+      if (!password) {
+        cryptoKey = null;
+        secBadge.innerText = "加密: 公開模式";
+        secBadge.className = "badge warn";
+        return;
+      }
+      try {
+        const enc = new TextEncoder();
+        const keyMaterial = await crypto.subtle.importKey(
+          "raw",
+          enc.encode(password),
+          { name: "PBKDF2" },
+          false,
+          ["deriveKey"]
+        );
+        cryptoKey = await crypto.subtle.deriveKey(
+          {
+            name: "PBKDF2",
+            salt: enc.encode("ray_walkie_secure_salt_hk_2026"),
+            iterations: 100000,
+            hash: "SHA-256"
+          },
+          keyMaterial,
+          { name: "AES-GCM", length: 128 },
+          false,
+          ["encrypt", "decrypt"]
+        );
+        secBadge.innerText = "加密: AES已鎖定";
+        secBadge.className = "badge ok";
+      } catch (err) {
+        cryptoKey = null;
+        secBadge.innerText = "加密: 啟動失敗";
+        secBadge.className = "badge off";
+      }
+    }
+
+    async function encryptPayload(uint8Data) {
+      if (!cryptoKey) return uint8Data;
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const encrypted = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: iv },
+        cryptoKey,
+        uint8Data
+      );
+      const combined = new Uint8Array(iv.length + encrypted.byteLength);
+      combined.set(iv, 0);
+      combined.set(new Uint8Array(encrypted), iv.length);
+      return combined;
+    }
+
+    async function decryptPayload(uint8Data) {
+      if (!cryptoKey) return uint8Data;
+      if (uint8Data.length <= 12) return null;
+      const iv = uint8Data.slice(0, 12);
+      const data = uint8Data.slice(12);
+      try {
+        const decrypted = await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: iv },
+          cryptoKey,
+          data
+        );
+        return new Uint8Array(decrypted);
+      } catch (e) {
+        // 密碼不符或未加密之封包，直接丟棄
+        return null;
+      }
+    }
+
+    // 載入本機已儲存嘅密碼
+    const savedPwd = localStorage.getItem('walkie_channel_pwd') || '';
+    if (savedPwd) {
+      channelPasswordInput.value = savedPwd;
+      setChannelPassword(savedPwd);
+    }
+
+    channelPasswordInput.addEventListener('input', async () => {
+      const pwd = channelPasswordInput.value.trim();
+      localStorage.setItem('walkie_channel_pwd', pwd);
+      await setChannelPassword(pwd);
+      statusText.innerText = pwd ? "🔒 已啟用密碼加密！雙方密碼相同方可收聽及看字幕" : "🔓 目前為公開頻道（未設密碼）";
+    });
 
     // 音量控制拉尺事件
     volSlider.oninput = () => {
@@ -448,14 +561,16 @@
       sttBadge.className = "badge ok";
     }
 
-    function publishTextSubtitle(text, isFinal) {
+    async function publishTextSubtitle(text, isFinal) {
       if (!client || !client.connected || !text) return;
-      const payload = JSON.stringify({
+      const jsonStr = JSON.stringify({
         sender: MY_ID_HEX,
         text: text,
         final: isFinal
       });
-      client.publish(currentTextTopic, payload, { qos: 0 });
+      const rawBytes = new TextEncoder().encode(jsonStr);
+      const outBytes = await encryptPayload(rawBytes);
+      client.publish(currentTextTopic, outBytes, { qos: 0 });
     }
 
     function upsertChatMessage(senderHex, text, isFinal, isMe) {
@@ -639,6 +754,7 @@
       }
 
       initSpeechRecognition();
+      await setChannelPassword(channelPasswordInput.value.trim());
 
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       rxGainNode = audioCtx.createGain();
@@ -685,10 +801,14 @@
         if (isTalking) stopTalking();
       });
 
-      client.on('message', (topic, payload) => {
+      client.on('message', async (topic, payload) => {
+        const rawIncoming = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+        const decrypted = await decryptPayload(rawIncoming);
+        if (!decrypted) return; // 密碼唔啱，直接無視該訊息或語音
+
         if (topic === currentTextTopic) {
           try {
-            const data = JSON.parse(new TextDecoder().decode(payload));
+            const data = JSON.parse(new TextDecoder().decode(decrypted));
             if (data.sender && data.sender !== MY_ID_HEX && data.text) {
               upsertChatMessage(data.sender, data.text, data.final, false);
             }
@@ -696,9 +816,9 @@
           return;
         }
 
-        if (topic !== currentTopic || isTalking || payload.byteLength <= 4) return;
+        if (topic !== currentTopic || isTalking || decrypted.byteLength <= 4) return;
 
-        const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+        const view = new DataView(decrypted.buffer, decrypted.byteOffset, decrypted.byteLength);
         const senderId = view.getUint32(0, true);
         if (senderId === MY_ID) return;
 
@@ -718,7 +838,7 @@
           }
         }, 350);
 
-        playIncomingUlaw(new Uint8Array(payload.buffer, payload.byteOffset + 4, payload.byteLength - 4));
+        playIncomingUlaw(new Uint8Array(decrypted.buffer, decrypted.byteOffset + 4, decrypted.byteLength - 4));
       });
     };
 
@@ -830,11 +950,13 @@
       silencer = audioCtx.createGain();
       silencer.gain.value = 0;
 
-      scriptNode.onaudioprocess = (e) => {
+      scriptNode.onaudioprocess = async (e) => {
         if (!isTalking || !client.connected) return;
         const inputData = e.inputBuffer.getChannelData(0);
         const packet = encodeAudioPacket(inputData, audioCtx.sampleRate);
-        client.publish(currentTopic, packet, { qos: 0 });
+        const outPacket = await encryptPayload(packet);
+        if (!isTalking || !client.connected) return;
+        client.publish(currentTopic, outPacket, { qos: 0 });
 
         txCount++;
         updateDebug();
