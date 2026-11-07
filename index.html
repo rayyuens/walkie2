@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.1 PWA 摺疊防干擾版</title>
+  <title>Web 對講機 - v10.1 PWA 摺疊版</title>
   
   <!-- PWA Manifest 內嵌支援 -->
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
@@ -273,7 +273,7 @@
 </head>
 <body>
 
-  <div class="ver">v10.1 PWA 摺疊版 (雙重防干擾靜音鎖)</div>
+  <div class="ver">v10.1 PWA 摺疊版</div>
   
   <!-- 預設摺疊：狀態燈號 -->
   <details>
@@ -283,7 +283,7 @@
       <div class="badge" id="netBadge">網絡: 待命</div>
       <div class="badge" id="micBadge">麥克風: 未授權</div>
       <div class="badge" id="sttBadge">粵語字幕: 待命</div>
-      <div class="badge warn" id="secBadge">加密: 公開模式</div>
+      <div class="badge warn" id="secBadge">密碼鎖: 公開模式</div>
     </div>
   </details>
 
@@ -300,7 +300,7 @@
       <button class="ctrl-btn mic-on" id="toggleMicBtn">停止麥克風</button>
       <button class="ctrl-btn stt-on" id="toggleSttBtn">字幕: 開啟</button>
 
-      <!-- 頻道加密密碼輸入框 -->
+      <!-- 零延遲同步密碼鎖輸入框 -->
       <div class="pwd-row">
         <span>🔑 密碼</span>
         <input type="password" id="channelPasswordInput" class="pwd-input" placeholder="輸入私人密碼防干擾 (留空為公開)">
@@ -331,13 +331,10 @@
   <script>
     const MQTT_BROKER = "wss://broker.hivemq.com:8884/mqtt";
     let baseTopic = "ray_walkie_hk/ch1";
-    let topicSecretSuffix = "/public";
-    let currentTopic = baseTopic + topicSecretSuffix;
+    let topicSecretSuffix = "";
+    let currentTopic = baseTopic;
     let currentTextTopic = currentTopic + "/text";
     const TARGET_RATE = 16000;
-
-    // 封包專屬驗證標頭 "RWK1" (0x52574B31)，確保唔同密碼或外人封包 100% 唔會當成聲音播出來
-    const PACKET_MAGIC = 0x52574B31;
 
     const MY_ID = Math.floor(Math.random() * 0xFFFFFFFF) >>> 0;
     const MY_ID_HEX = MY_ID.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
@@ -359,8 +356,10 @@
     let rxCount = 0;
     let rxTimeout = null;
 
-    // 端對端 AES-GCM 加密金鑰
-    let cryptoKey = null;
+    // 零延遲同步密碼鎖變數（唔用 async WebCrypto，100% 唔會拖慢舊手機 CPU 或搞亂封包順序）
+    const DEFAULT_MAGIC = 0x52574B31; // 公開模式識別碼
+    let currentMagic = DEFAULT_MAGIC;
+    let cipherMask = null;
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     let recognition = null;
@@ -386,8 +385,17 @@
     const chatBox = document.getElementById('chatBox');
 
     // ====================================================
-    // 雙重防干擾加密：1. 隱藏私人 Topic 路徑 + 2. AES-GCM 封包加密
+    // 零延遲同步密碼計算（0ms 同步執行，完全不阻塞音訊流）
     // ====================================================
+    function fnv1a32(str) {
+      let h = 0x811c9dc5;
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+      }
+      return h >>> 0;
+    }
+
     function refreshSubscriptionTopics() {
       const newTopic = baseTopic + topicSecretSuffix;
       const newTextTopic = newTopic + "/text";
@@ -406,119 +414,50 @@
       }
     }
 
-    async function setChannelPassword(password) {
-      if (!password) {
-        cryptoKey = null;
-        topicSecretSuffix = "/public";
+    function applyChannelPassword(pwd) {
+      if (!pwd) {
+        currentMagic = DEFAULT_MAGIC;
+        cipherMask = null;
+        topicSecretSuffix = "";
         refreshSubscriptionTopics();
-        secBadge.innerText = "加密: 公開模式";
+        secBadge.innerText = "密碼鎖: 公開模式";
         secBadge.className = "badge warn";
         return;
       }
-      try {
-        const enc = new TextEncoder();
-        // 1. 產生隱藏版私人頻道 Hash，外人連 Topic 名都撞唔中
-        const hashBuf = await crypto.subtle.digest("SHA-256", enc.encode("walkie_room_" + password));
-        const hashHex = Array.from(new Uint8Array(hashBuf)).slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');
-        topicSecretSuffix = "/sec_" + hashHex;
-        refreshSubscriptionTopics();
 
-        // 2. 產生 AES-GCM 128-bit 金鑰
-        const keyMaterial = await crypto.subtle.importKey(
-          "raw",
-          enc.encode(password),
-          { name: "PBKDF2" },
-          false,
-          ["deriveKey"]
-        );
-        cryptoKey = await crypto.subtle.deriveKey(
-          {
-            name: "PBKDF2",
-            salt: enc.encode("ray_walkie_secure_salt_hk_2026"),
-            iterations: 100000,
-            hash: "SHA-256"
-          },
-          keyMaterial,
-          { name: "AES-GCM", length: 128 },
-          false,
-          ["encrypt", "decrypt"]
-        );
-        secBadge.innerText = "加密: 私人防干擾鎖定";
-        secBadge.className = "badge ok";
-      } catch (err) {
-        cryptoKey = null;
-        secBadge.innerText = "加密: 啟動失敗";
-        secBadge.className = "badge off";
+      // 1. 產生專屬 Topic 後綴與 32-bit 封包簽名碼
+      const roomHash = fnv1a32("room_topic_" + pwd).toString(16).padStart(8, '0');
+      topicSecretSuffix = "/ lock_" + roomHash;
+      currentMagic = fnv1a32("packet_magic_" + pwd);
+      if (currentMagic === DEFAULT_MAGIC) currentMagic ^= 0x12345678;
+
+      // 2. 產生 64-byte 高速同步遮罩表
+      cipherMask = new Uint8Array(64);
+      let seed = fnv1a32("mask_seed_" + pwd);
+      for (let i = 0; i < 64; i++) {
+        seed ^= seed << 13;
+        seed ^= seed >>> 17;
+        seed ^= seed << 5;
+        cipherMask[i] = (seed >>> 0) & 0xFF;
       }
+
+      refreshSubscriptionTopics();
+      secBadge.innerText = "密碼鎖: 已鎖定";
+      secBadge.className = "badge ok";
     }
 
-    // 封包格式：
-    // 公開模式：[0x00 (1 byte)] + [原始資料]
-    // 加密模式：[0x01 (1 byte)] + [12 bytes IV] + [AES-GCM 密文]
-    async function encryptPayload(uint8Data) {
-      if (!cryptoKey) {
-        const out = new Uint8Array(1 + uint8Data.byteLength);
-        out[0] = 0x00; // 標記為無密碼公開封包
-        out.set(uint8Data, 1);
-        return out;
-      }
-      const iv = crypto.getRandomValues(new Uint8Array(12));
-      const encrypted = await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv: iv },
-        cryptoKey,
-        uint8Data
-      );
-      const combined = new Uint8Array(1 + iv.length + encrypted.byteLength);
-      combined[0] = 0x01; // 標記為 AES 加密封包
-      combined.set(iv, 1);
-      combined.set(new Uint8Array(encrypted), 1 + iv.length);
-      return combined;
-    }
-
-    async function decryptPayload(uint8Data) {
-      if (!uint8Data || uint8Data.byteLength < 2) return null;
-      const mode = uint8Data[0];
-
-      // 如果本機有設密碼，但收到未加密封包 -> 100% 攔截靜音
-      if (cryptoKey && mode !== 0x01) return null;
-      // 如果本機無設密碼，但收到加密封包 -> 100% 攔截靜音（防止將密文當聲音播造成沙沙聲！）
-      if (!cryptoKey && mode !== 0x00) return null;
-
-      if (mode === 0x00) {
-        return uint8Data.slice(1);
-      }
-
-      if (mode === 0x01) {
-        if (uint8Data.byteLength <= 13) return null;
-        const iv = uint8Data.slice(1, 13);
-        const data = uint8Data.slice(13);
-        try {
-          const decrypted = await crypto.subtle.decrypt(
-            { name: "AES-GCM", iv: iv },
-            cryptoKey,
-            data
-          );
-          return new Uint8Array(decrypted);
-        } catch (e) {
-          // 密碼錯誤：AES-GCM 驗證失敗，直接 return null 保持絕對靜音！
-          return null;
-        }
-      }
-      return null;
-    }
-
-    // 載入本機已儲存嘅密碼
+    // 讀取已儲存密碼
     const savedPwd = localStorage.getItem('walkie_channel_pwd') || '';
     if (savedPwd) {
       channelPasswordInput.value = savedPwd;
-      setChannelPassword(savedPwd);
+      applyChannelPassword(savedPwd);
     }
 
-    channelPasswordInput.addEventListener('input', async () => {
+    channelPasswordInput.addEventListener('input', () => {
       const pwd = channelPasswordInput.value.trim();
       localStorage.setItem('walkie_channel_pwd', pwd);
-      await setChannelPassword(pwd);
-      statusText.innerText = pwd ? "🔒 已切換至私人加密頻道！錯密碼或外人 100% 零雜音" : "🔓 目前為公開頻道（未設密碼）";
+      applyChannelPassword(pwd);
+      statusText.innerText = pwd ? "🔒 已鎖定私人密碼頻道（零延遲同步模式）" : "🔓 目前為公開頻道（未設密碼）";
     });
 
     // 音量控制拉尺事件
@@ -616,16 +555,15 @@
       sttBadge.className = "badge ok";
     }
 
-    async function publishTextSubtitle(text, isFinal) {
+    function publishTextSubtitle(text, isFinal) {
       if (!client || !client.connected || !text) return;
-      const jsonStr = JSON.stringify({
+      const payload = JSON.stringify({
+        magic: currentMagic,
         sender: MY_ID_HEX,
         text: text,
         final: isFinal
       });
-      const rawBytes = new TextEncoder().encode(jsonStr);
-      const outBytes = await encryptPayload(rawBytes);
-      client.publish(currentTextTopic, outBytes, { qos: 0 });
+      client.publish(currentTextTopic, payload, { qos: 0 });
     }
 
     function upsertChatMessage(senderHex, text, isFinal, isMe) {
@@ -802,7 +740,7 @@
       }
 
       initSpeechRecognition();
-      await setChannelPassword(channelPasswordInput.value.trim());
+      applyChannelPassword(channelPasswordInput.value.trim());
 
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       rxGainNode = audioCtx.createGain();
@@ -849,28 +787,24 @@
         if (isTalking) stopTalking();
       });
 
-      client.on('message', async (topic, payload) => {
-        const rawIncoming = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
-        const decrypted = await decryptPayload(rawIncoming);
-        // 如果密碼唔同、或者一邊有設密碼一邊無設密碼，decrypted 會係 null，100% 靜音丟棄！
-        if (!decrypted) return;
-
+      // 100% 同步接收處理（無 async/await，保證舊手機封包次序絕對唔亂、聲音唔變矇）
+      client.on('message', (topic, payload) => {
         if (topic === currentTextTopic) {
           try {
-            const data = JSON.parse(new TextDecoder().decode(decrypted));
-            if (data.sender && data.sender !== MY_ID_HEX && data.text) {
+            const data = JSON.parse(new TextDecoder().decode(payload));
+            if (data.magic === currentMagic && data.sender && data.sender !== MY_ID_HEX && data.text) {
               upsertChatMessage(data.sender, data.text, data.final, false);
             }
           } catch (e) {}
           return;
         }
 
-        if (topic !== currentTopic || isTalking || decrypted.byteLength <= 8) return;
+        if (topic !== currentTopic || isTalking || payload.byteLength <= 8) return;
 
-        const view = new DataView(decrypted.buffer, decrypted.byteOffset, decrypted.byteLength);
-        // 檢查封包專屬簽名 "RWK1"，唔啱簽名嘅雜訊封包一律靜音丟棄
-        const magic = view.getUint32(0, false);
-        if (magic !== PACKET_MAGIC) return;
+        const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+        const packetMagic = view.getUint32(0, true);
+        // 密碼鎖驗證：如果密碼唔啱，直接 return，100% 零雜音！
+        if (packetMagic !== currentMagic) return;
 
         const senderId = view.getUint32(4, true);
         if (senderId === MY_ID) return;
@@ -878,12 +812,27 @@
         rxCount++;
         updateDebug();
 
+        // 關鍵修復：收聽期間暫時將本機麥克風 Track 靜音，防止舊手機觸發硬件回音消除 (AEC Ducking) 將後半句聲音壓細變矇！
+        if (micStream && !isTalking) {
+          const tracks = micStream.getAudioTracks();
+          for (let i = 0; i < tracks.length; i++) {
+            if (tracks[i].enabled) tracks[i].enabled = false;
+          }
+        }
+
         pttBtn.classList.add('receiving');
         pttBtn.innerText = "對方講話中...";
         statusText.innerText = `正在接收來自 [${senderId.toString(16).toUpperCase().padStart(8, '0').slice(0, 4)}] 的語音...`;
         clearTimeout(rxTimeout);
         rxTimeout = setTimeout(() => {
           if (!isTalking) {
+            // 對面講完嘢，自動恢復本機麥克風 Track 待命
+            if (micStream && micEnabled) {
+              const tracks = micStream.getAudioTracks();
+              for (let i = 0; i < tracks.length; i++) {
+                tracks[i].enabled = true;
+              }
+            }
             pttBtn.classList.remove('receiving');
             pttBtn.innerText = micEnabled ? "按住通話 (PTT)" : "純收聽模式\n(已關閉麥克風)";
             statusText.innerText = micEnabled ? "已連線！放開收聽，按住通話" : "純收聽模式待命中";
@@ -891,7 +840,18 @@
           }
         }, 350);
 
-        playIncomingUlaw(new Uint8Array(decrypted.buffer, decrypted.byteOffset + 8, decrypted.byteLength - 8));
+        const audioLen = payload.byteLength - 8;
+        const audioBytes = new Uint8Array(audioLen);
+        const srcBytes = new Uint8Array(payload.buffer, payload.byteOffset + 8, audioLen);
+        if (cipherMask) {
+          for (let i = 0; i < audioLen; i++) {
+            audioBytes[i] = srcBytes[i] ^ cipherMask[i & 63];
+          }
+        } else {
+          audioBytes.set(srcBytes);
+        }
+
+        playIncomingUlaw(audioBytes);
       });
     };
 
@@ -942,10 +902,9 @@
     function encodeAudioPacket(float32Buffer, inputRate) {
       const ratio = inputRate / TARGET_RATE;
       const sampleCount = Math.floor(float32Buffer.length / ratio);
-      // 8 bytes Header: [4 bytes PACKET_MAGIC] + [4 bytes MY_ID]
       const packet = new Uint8Array(8 + sampleCount);
       const view = new DataView(packet.buffer);
-      view.setUint32(0, PACKET_MAGIC, false);
+      view.setUint32(0, currentMagic, true);
       view.setUint32(4, MY_ID, true);
 
       for (let i = 0; i < sampleCount; i++) {
@@ -967,7 +926,8 @@
 
         let clamped = Math.max(-1, Math.min(1, avg));
         let int16 = clamped < 0 ? (clamped * 32768) : (clamped * 32767);
-        packet[8 + i] = linearToUlaw(int16 | 0);
+        const ulawByte = linearToUlaw(int16 | 0);
+        packet[8 + i] = cipherMask ? (ulawByte ^ cipherMask[i & 63]) : ulawByte;
       }
       return packet;
     }
@@ -984,6 +944,12 @@
         return;
       }
       if (!client || !client.connected || isTalking) return;
+
+      // 確保發話時麥克風 Track 處於開啟狀態
+      const tracks = micStream.getAudioTracks();
+      for (let i = 0; i < tracks.length; i++) {
+        tracks[i].enabled = true;
+      }
 
       isTalking = true;
       currentTranscript = "";
@@ -1005,13 +971,12 @@
       silencer = audioCtx.createGain();
       silencer.gain.value = 0;
 
-      scriptNode.onaudioprocess = async (e) => {
+      // 100% 同步發送，無 async 延遲
+      scriptNode.onaudioprocess = (e) => {
         if (!isTalking || !client.connected) return;
         const inputData = e.inputBuffer.getChannelData(0);
         const packet = encodeAudioPacket(inputData, audioCtx.sampleRate);
-        const outPacket = await encryptPayload(packet);
-        if (!isTalking || !client.connected) return;
-        client.publish(currentTopic, outPacket, { qos: 0 });
+        client.publish(currentTopic, packet, { qos: 0 });
 
         txCount++;
         updateDebug();
