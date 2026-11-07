@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.6 雙向字幕完整修復版</title>
+  <title>Web 對講機 - v10.7 PC與iPhone字幕終極修復版</title>
   
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
   <meta name="theme-color" content="#0b0d10">
@@ -169,6 +169,17 @@
       color: #00e5ff;
       font-family: monospace;
     }
+    .hint-box {
+      width: 100%;
+      font-size: 11px;
+      color: #ffab00;
+      background: rgba(255, 171, 0, 0.08);
+      border: 1px solid rgba(255, 171, 0, 0.3);
+      padding: 6px 8px;
+      border-radius: 6px;
+      line-height: 1.4;
+      display: none;
+    }
     .status {
       margin-bottom: 14px;
       font-size: 14px;
@@ -229,8 +240,8 @@
       display: none;
       width: 90%;
       max-width: 400px;
-      height: 170px;
-      margin-top: 16px;
+      height: 165px;
+      margin-top: 14px;
       background: #14171d;
       border: 1px solid #262b33;
       border-radius: 10px;
@@ -261,8 +272,42 @@
       color: #90a4ae;
       font-style: italic;
     }
+    /* 手動/快速字幕輸入列 */
+    .manual-sub-row {
+      display: none;
+      width: 90%;
+      max-width: 400px;
+      margin-top: 6px;
+      gap: 6px;
+      box-sizing: border-box;
+    }
+    .manual-sub-input {
+      flex: 1;
+      background: #14171d;
+      border: 1px solid #262b33;
+      border-radius: 8px;
+      padding: 8px 10px;
+      color: #fff;
+      font-size: 13px;
+      outline: none;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    .manual-sub-input:focus {
+      border-color: #00e5ff;
+    }
+    .manual-sub-btn {
+      background: #1c2026;
+      color: #00e5ff;
+      border: 1px solid #37474f;
+      border-radius: 8px;
+      padding: 0 14px;
+      font-size: 13px;
+      font-weight: bold;
+      cursor: pointer;
+    }
     .debug {
-      margin-top: 12px;
+      margin-top: 10px;
       font-size: 12px;
       color: #00e676;
       font-family: monospace;
@@ -274,9 +319,10 @@
   </style>
 </head>
 <body>
-  <div class="ver">v10.6 雙向字幕完整修復版</div>
+  <div class="ver">v10.7 PC與iPhone字幕終極修復版</div>
   
-  <details>
+  <!-- 預設展開狀態燈號，一眼睇到粵語字幕有冇捉到聲 -->
+  <details open>
     <summary>📊 系統狀態燈號</summary>
     <div class="badges">
       <div class="badge" id="wakeBadge">螢幕常亮: 未啟動</div>
@@ -303,6 +349,10 @@
         <option value="">🎙️ 預設麥克風</option>
       </select>
 
+      <div class="hint-box" id="pcMicHint">
+        💡 <b>電腦字幕提示</b>：Chrome 語音辨識固定讀取 <b>Windows 系統預設輸入裝置</b>。如對講有聲但無字幕，請在 Windows 右下角喇叭圖示將此麥克風設為「系統預設」。
+      </div>
+
       <div class="pwd-row">
         <span>🔑 密碼</span>
         <input type="password" id="channelPasswordInput" class="pwd-input" placeholder="輸入私人密碼防干擾 (留空為公開)">
@@ -322,8 +372,14 @@
 
   <div class="chat-box" id="chatBox">
     <div class="chat-msg" style="color:#607d8b; text-align:center; font-size:12px;">
-      --- 廣東話即時字幕 (PC / 手機雙向同步) ---
+      --- 廣東話即時字幕 (按住 PTT 講話或下方直接輸入) ---
     </div>
+  </div>
+
+  <!-- 電腦/手機快速打字發送字幕欄 -->
+  <div class="manual-sub-row" id="manualSubRow">
+    <input type="text" id="manualSubInput" class="manual-sub-input" placeholder="直接打字發送字幕 (按 Enter 發送)...">
+    <button id="manualSubBtn" class="manual-sub-btn">發送</button>
   </div>
 
   <div class="debug" id="debugText">本機 ID: ---- | TX: 0 | RX: 0</div>
@@ -338,6 +394,9 @@
     const MY_ID = Math.floor(Math.random() * 0xFFFFFFFF) >>> 0;
     const MY_ID_HEX = MY_ID.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
 
+    const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    const IS_EDGE = /Edg\//i.test(navigator.userAgent);
+
     let client = null;
     let audioCtx = null;
     let rxGainNode = null;
@@ -351,6 +410,8 @@
     let wakeLock = null;
     let keepAliveTimer = null;
     let isTalking = false;
+    let sttCaptureWindow = false; // 允許放手後 600ms 內遲來嘅雲端辨識結果照常發送
+    let sttWindowTimer = null;
     let nextStartTime = 0;
     let lastSample = 0;
     let txCount = 0;
@@ -367,6 +428,7 @@
     let sttEnabled = true;
     let currentTranscript = "";
     let recognitionActive = false;
+    let resultIndexOffset = 0;
 
     const initBtn = document.getElementById('initBtn');
     const pttBtn = document.getElementById('pttBtn');
@@ -380,12 +442,20 @@
     const controlsDetails = document.getElementById('controlsDetails');
     const channelSelect = document.getElementById('channelSelect');
     const micSelect = document.getElementById('micSelect');
+    const pcMicHint = document.getElementById('pcMicHint');
     const toggleMicBtn = document.getElementById('toggleMicBtn');
     const toggleSttBtn = document.getElementById('toggleSttBtn');
     const channelPasswordInput = document.getElementById('channelPasswordInput');
     const volSlider = document.getElementById('volSlider');
     const volValue = document.getElementById('volValue');
     const chatBox = document.getElementById('chatBox');
+    const manualSubRow = document.getElementById('manualSubRow');
+    const manualSubInput = document.getElementById('manualSubInput');
+    const manualSubBtn = document.getElementById('manualSubBtn');
+
+    if (!IS_MOBILE) {
+      pcMicHint.style.display = 'block';
+    }
 
     function fnv1a32(str) {
       let h = 0x811c9dc5;
@@ -493,11 +563,11 @@
     updateDebug();
 
     // ====================================================
-    // 原生廣東話語音辨識（PC Chrome + iOS 雙平台相容）
+    // 原生廣東話語音辨識（解決 PC Chrome / Edge 與 iOS 差異）
     // ====================================================
     function initSpeechRecognition() {
       if (!SpeechRecognition) {
-        sttBadge.innerText = "粵語字幕: 瀏覽器不支援";
+        sttBadge.innerText = "粵語字幕: 瀏覽器不支援(請用Chrome)";
         sttBadge.className = "badge off";
         toggleSttBtn.style.display = 'none';
         return;
@@ -510,14 +580,29 @@
 
       recognition.onstart = () => {
         recognitionActive = true;
-        sttBadge.innerText = "粵語字幕: 聽寫中...";
+        resultIndexOffset = 0;
+        sttBadge.innerText = isTalking ? "粵語字幕: 🎙️聽寫中..." : "粵語字幕: 預熱待命";
         sttBadge.className = "badge ok";
       };
 
+      recognition.onspeechstart = () => {
+        if (isTalking) {
+          sttBadge.innerText = "粵語字幕: 🗣️偵測到說話!";
+          sttBadge.className = "badge ok";
+        }
+      };
+
       recognition.onresult = (event) => {
+        // 如果喺電腦常駐模式下未撳 PTT，忽略背景雜音並推進 offset
+        if (!isTalking && !sttCaptureWindow) {
+          resultIndexOffset = event.results.length;
+          return;
+        }
+
         let interim = "";
         let finalStr = "";
-        for (let i = 0; i < event.results.length; i++) {
+        const startIdx = Math.min(resultIndexOffset, event.results.length);
+        for (let i = startIdx; i < event.results.length; i++) {
           const res = event.results[i];
           const transcript = res[0].transcript;
           if (res.isFinal) {
@@ -527,33 +612,42 @@
           }
         }
         currentTranscript = (finalStr + interim).trim();
-        // 只要用戶正在通話（或者啱啱放手未送出），就實時發布文字
-        if (currentTranscript && (isTalking || recognitionActive)) {
+        if (currentTranscript) {
+          sttBadge.innerText = "粵語字幕: ✅已輸出字幕";
+          sttBadge.className = "badge ok";
           upsertChatMessage(MY_ID_HEX, currentTranscript, false, true);
           publishTextSubtitle(currentTranscript, false);
         }
       };
 
       recognition.onerror = (e) => {
-        if (e.error === 'not-allowed') {
-          sttBadge.innerText = "粵語字幕: 權限遭拒";
+        console.warn("STT Error:", e.error);
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          sttBadge.innerText = "粵語字幕: 權限被拒";
           sttBadge.className = "badge off";
-        } else if (e.error !== 'no-speech' && e.error !== 'aborted') {
-          console.warn("STT warning:", e.error);
+        } else if (e.error === 'network') {
+          sttBadge.innerText = IS_EDGE ? "粵語字幕: Edge不支援(請用Chrome)" : "粵語字幕: 網絡阻擋";
+          sttBadge.className = "badge off";
+        } else if (e.error === 'audio-capture') {
+          sttBadge.innerText = "粵語字幕: 找不到系統預設咪";
+          sttBadge.className = "badge off";
         }
       };
 
       recognition.onend = () => {
         recognitionActive = false;
-        // 如果放開掣後仲有文字未發送做 Final，即時送出
-        if (currentTranscript) {
+        if (currentTranscript && (isTalking || sttCaptureWindow)) {
           upsertChatMessage(MY_ID_HEX, currentTranscript, true, true);
           publishTextSubtitle(currentTranscript, true);
           currentTranscript = "";
         }
-        // 如果通話中途被 Chrome 自動斷開，即刻重連
-        if (isTalking && sttEnabled) {
-          try { recognition.start(); } catch (err) {}
+        // 在 PC 上保持常駐連線（避免每次按 PTT 都要重新握手導致漏字）
+        if (sttEnabled && micEnabled && (!IS_MOBILE || isTalking)) {
+          setTimeout(() => {
+            if (sttEnabled && micEnabled && !recognitionActive && (!IS_MOBILE || isTalking)) {
+              try { recognition.start(); } catch (err) {}
+            }
+          }, 150);
         } else if (sttEnabled) {
           sttBadge.innerText = "粵語字幕: 就緒";
           sttBadge.className = "badge ok";
@@ -562,6 +656,11 @@
 
       sttBadge.innerText = "粵語字幕: 就緒";
       sttBadge.className = "badge ok";
+
+      // 如果係電腦 (PC)，喺點擊啟動時直接預熱開啟 SpeechRecognition
+      if (!IS_MOBILE && sttEnabled) {
+        try { recognition.start(); } catch (e) {}
+      }
     }
 
     function publishTextSubtitle(text, isFinal) {
@@ -595,6 +694,22 @@
       chatBox.scrollTop = chatBox.scrollHeight;
     }
 
+    // 手動打字發送字幕功能
+    function sendManualSubtitle() {
+      const txt = manualSubInput.value.trim();
+      if (!txt) return;
+      upsertChatMessage(MY_ID_HEX, txt, true, true);
+      publishTextSubtitle(txt, true);
+      manualSubInput.value = "";
+    }
+    manualSubBtn.onclick = sendManualSubtitle;
+    manualSubInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        sendManualSubtitle();
+      }
+    });
+
     toggleSttBtn.onclick = () => {
       sttEnabled = !sttEnabled;
       if (sttEnabled) {
@@ -602,6 +717,9 @@
         toggleSttBtn.className = "ctrl-btn stt-on";
         sttBadge.innerText = "粵語字幕: 就緒";
         sttBadge.className = "badge ok";
+        if (!IS_MOBILE && recognition && !recognitionActive) {
+          try { recognition.start(); } catch (e) {}
+        }
       } else {
         if (recognition && recognitionActive) {
           try { recognition.stop(); } catch (e) {}
@@ -831,6 +949,7 @@
         controlsDetails.style.display = 'block';
         pttBtn.style.display = 'block';
         chatBox.style.display = 'block';
+        manualSubRow.style.display = 'flex';
         client.subscribe(currentTopic, { qos: 0 });
         client.subscribe(currentTextTopic, { qos: 0 });
         playRogerBeep(1400, 60);
@@ -870,7 +989,8 @@
         rxCount++;
         updateDebug();
 
-        if (micStream && !isTalking) {
+        // 僅在手機上收聽時暫時 mute mic 防回音；電腦保持開啟以免中斷常駐語音辨識
+        if (IS_MOBILE && micStream && !isTalking) {
           const tracks = micStream.getAudioTracks();
           for (let i = 0; i < tracks.length; i++) {
             if (tracks[i].enabled) tracks[i].enabled = false;
@@ -983,7 +1103,9 @@
     window.addEventListener('mouseup', () => { if (isTalking) stopTalking(); });
 
     window.addEventListener('keydown', (e) => {
-      if (e.code === 'Space' && !e.repeat && document.activeElement !== channelPasswordInput) {
+      if (e.code === 'Space' && !e.repeat && 
+          document.activeElement !== channelPasswordInput && 
+          document.activeElement !== manualSubInput) {
         if (pttBtn.style.display === 'block') {
           e.preventDefault();
           startTalking();
@@ -991,7 +1113,9 @@
       }
     });
     window.addEventListener('keyup', (e) => {
-      if (e.code === 'Space' && document.activeElement !== channelPasswordInput) {
+      if (e.code === 'Space' && 
+          document.activeElement !== channelPasswordInput && 
+          document.activeElement !== manualSubInput) {
         if (isTalking) {
           e.preventDefault();
           stopTalking();
@@ -1006,6 +1130,20 @@
       }
       if (!client || !client.connected || isTalking) return;
 
+      isTalking = true;
+      sttCaptureWindow = true;
+      clearTimeout(sttWindowTimer);
+      currentTranscript = "";
+
+      // 【關鍵修復】：必須喺任何 await 之前 0ms 同步啟動 SpeechRecognition！
+      if (sttEnabled && recognition) {
+        sttBadge.innerText = "粵語字幕: 🎙️聽寫中...";
+        sttBadge.className = "badge ok";
+        if (!recognitionActive) {
+          try { recognition.start(); } catch (e) {}
+        }
+      }
+
       const tracks = micStream.getAudioTracks();
       if (tracks.length === 0 || tracks[0].readyState === 'ended') {
         await enableMicrophone();
@@ -1014,8 +1152,6 @@
         micStream.getAudioTracks()[i].enabled = true;
       }
 
-      isTalking = true;
-      currentTranscript = "";
       pttBtn.classList.remove('receiving');
       pttBtn.classList.add('active');
       pttBtn.innerText = "正在廣播中...";
@@ -1025,17 +1161,6 @@
       if (!isTalking) return;
 
       playRogerBeep(1500, 45);
-
-      // 啟動原生廣東話聽寫
-      if (sttEnabled && recognition) {
-        try {
-          if (!recognitionActive) {
-            recognition.start();
-          }
-        } catch (e) {
-          console.warn("Recognition start skipped:", e);
-        }
-      }
 
       if (!micSourceNode) {
         micSourceNode = audioCtx.createMediaStreamSource(micStream);
@@ -1080,17 +1205,19 @@
 
       playRogerBeep(1050, 60);
 
-      // 電腦 Chrome 特有延遲安全關閉：
-      // 延遲 300ms 先 stop，確保 Google 語音辨識伺服器最後一個 final 封包順利回傳並發布
-      if (recognition && recognitionActive) {
-        setTimeout(() => {
-          if (!isTalking && recognition && recognitionActive) {
-            try {
-              recognition.stop();
-            } catch (e) {}
-          }
-        }, 300);
-      }
+      // 保持 700ms 收尾窗口，確保 PC Chrome 雲端遲返回嘅最後幾個字照樣入到字幕框
+      clearTimeout(sttWindowTimer);
+      sttWindowTimer = setTimeout(() => {
+        sttCaptureWindow = false;
+        if (currentTranscript) {
+          upsertChatMessage(MY_ID_HEX, currentTranscript, true, true);
+          publishTextSubtitle(currentTranscript, true);
+          currentTranscript = "";
+        }
+        if (recognition && recognitionActive) {
+          try { recognition.stop(); } catch (e) {}
+        }
+      }, 700);
     }
   </script>
 </body>
