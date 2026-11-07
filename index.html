@@ -356,8 +356,8 @@
     let rxCount = 0;
     let rxTimeout = null;
 
-    // 零延遲同步密碼鎖變數（唔用 async WebCrypto，100% 唔會拖慢舊手機 CPU 或搞亂封包順序）
-    const DEFAULT_MAGIC = 0x52574B31; // 公開模式識別碼
+    // 零延遲同步密碼鎖變數
+    const DEFAULT_MAGIC = 0x52574B31;
     let currentMagic = DEFAULT_MAGIC;
     let cipherMask = null;
 
@@ -384,9 +384,6 @@
     const volValue = document.getElementById('volValue');
     const chatBox = document.getElementById('chatBox');
 
-    // ====================================================
-    // 零延遲同步密碼計算（0ms 同步執行，完全不阻塞音訊流）
-    // ====================================================
     function fnv1a32(str) {
       let h = 0x811c9dc5;
       for (let i = 0; i < str.length; i++) {
@@ -425,13 +422,11 @@
         return;
       }
 
-      // 1. 產生專屬 Topic 後綴與 32-bit 封包簽名碼
       const roomHash = fnv1a32("room_topic_" + pwd).toString(16).padStart(8, '0');
-      topicSecretSuffix = "/ lock_" + roomHash;
+      topicSecretSuffix = "/lock_" + roomHash;
       currentMagic = fnv1a32("packet_magic_" + pwd);
       if (currentMagic === DEFAULT_MAGIC) currentMagic ^= 0x12345678;
 
-      // 2. 產生 64-byte 高速同步遮罩表
       cipherMask = new Uint8Array(64);
       let seed = fnv1a32("mask_seed_" + pwd);
       for (let i = 0; i < 64; i++) {
@@ -446,7 +441,6 @@
       secBadge.className = "badge ok";
     }
 
-    // 讀取已儲存密碼
     const savedPwd = localStorage.getItem('walkie_channel_pwd') || '';
     if (savedPwd) {
       channelPasswordInput.value = savedPwd;
@@ -460,7 +454,6 @@
       statusText.innerText = pwd ? "🔒 已鎖定私人密碼頻道（零延遲同步模式）" : "🔓 目前為公開頻道（未設密碼）";
     });
 
-    // 音量控制拉尺事件
     volSlider.oninput = () => {
       const pct = parseInt(volSlider.value, 10);
       volValue.innerText = pct + "%";
@@ -624,6 +617,10 @@
 
     async function enableMicrophone() {
       try {
+        if (micStream) {
+          micStream.getTracks().forEach(track => track.stop());
+          micStream = null;
+        }
         micStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: true,
@@ -733,21 +730,38 @@
       initBtn.disabled = true;
       statusText.innerText = "正在啟動音訊引擎與廣東話辨識...";
 
+      // 步驟 1：先啟動 AudioContext 並搶佔主喇叭輸出通道（防止舊機跌落細聲聽筒模式）
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      rxGainNode = audioCtx.createGain();
+      rxGainNode.gain.value = rxVolume;
+      rxGainNode.connect(audioCtx.destination);
+      await ensureAudioActive();
+
+      const unlockBuf = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
+      const unlockSrc = audioCtx.createBufferSource();
+      unlockSrc.buffer = unlockBuf;
+      unlockSrc.connect(audioCtx.destination);
+      unlockSrc.start();
+
+      // 步驟 2：授權並開啟麥克風
       const ok = await enableMicrophone();
       if (!ok) {
         initBtn.disabled = false;
         return;
       }
 
+      // 步驟 3：自動執行一次「關咪 -> 重開咪」循環，以及預載待機靜音，確保第一次收音即刻係正常大聲！
+      disableMicrophone();
+      await new Promise(r => setTimeout(r, 80));
+      await enableMicrophone();
+      if (micStream) {
+        // 平時待機收聽時先設為 enabled = false，撳 PTT 先開，徹底防止舊機第一次收聽變細聲
+        micStream.getAudioTracks().forEach(t => { t.enabled = false; });
+      }
+
       initSpeechRecognition();
       applyChannelPassword(channelPasswordInput.value.trim());
 
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      rxGainNode = audioCtx.createGain();
-      rxGainNode.gain.value = rxVolume;
-      rxGainNode.connect(audioCtx.destination);
-
-      await ensureAudioActive();
       startAudioKeepAlive();
       await requestWakeLock();
 
@@ -787,7 +801,6 @@
         if (isTalking) stopTalking();
       });
 
-      // 100% 同步接收處理（無 async/await，保證舊手機封包次序絕對唔亂、聲音唔變矇）
       client.on('message', (topic, payload) => {
         if (topic === currentTextTopic) {
           try {
@@ -803,7 +816,6 @@
 
         const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
         const packetMagic = view.getUint32(0, true);
-        // 密碼鎖驗證：如果密碼唔啱，直接 return，100% 零雜音！
         if (packetMagic !== currentMagic) return;
 
         const senderId = view.getUint32(4, true);
@@ -812,7 +824,6 @@
         rxCount++;
         updateDebug();
 
-        // 關鍵修復：收聽期間暫時將本機麥克風 Track 靜音，防止舊手機觸發硬件回音消除 (AEC Ducking) 將後半句聲音壓細變矇！
         if (micStream && !isTalking) {
           const tracks = micStream.getAudioTracks();
           for (let i = 0; i < tracks.length; i++) {
@@ -826,13 +837,6 @@
         clearTimeout(rxTimeout);
         rxTimeout = setTimeout(() => {
           if (!isTalking) {
-            // 對面講完嘢，自動恢復本機麥克風 Track 待命
-            if (micStream && micEnabled) {
-              const tracks = micStream.getAudioTracks();
-              for (let i = 0; i < tracks.length; i++) {
-                tracks[i].enabled = true;
-              }
-            }
             pttBtn.classList.remove('receiving');
             pttBtn.innerText = micEnabled ? "按住通話 (PTT)" : "純收聽模式\n(已關閉麥克風)";
             statusText.innerText = micEnabled ? "已連線！放開收聽，按住通話" : "純收聽模式待命中";
@@ -945,7 +949,7 @@
       }
       if (!client || !client.connected || isTalking) return;
 
-      // 確保發話時麥克風 Track 處於開啟狀態
+      // 按住 PTT 時先激活麥克風 Track
       const tracks = micStream.getAudioTracks();
       for (let i = 0; i < tracks.length; i++) {
         tracks[i].enabled = true;
@@ -971,7 +975,6 @@
       silencer = audioCtx.createGain();
       silencer.gain.value = 0;
 
-      // 100% 同步發送，無 async 延遲
       scriptNode.onaudioprocess = (e) => {
         if (!isTalking || !client.connected) return;
         const inputData = e.inputBuffer.getChannelData(0);
@@ -1001,6 +1004,14 @@
       if (silencer) {
         silencer.disconnect();
         silencer = null;
+      }
+
+      // 放開 PTT 後即刻將麥克風 Track 靜音待機，確保收聽對方時永遠係最大聲嘅主喇叭模式
+      if (micStream) {
+        const tracks = micStream.getAudioTracks();
+        for (let i = 0; i < tracks.length; i++) {
+          tracks[i].enabled = false;
+        }
       }
 
       if (recognition) {
