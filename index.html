@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.5 原生字幕修復版</title>
+  <title>Web 對講機 - v10.6 雙向字幕完整修復版</title>
   
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
   <meta name="theme-color" content="#0b0d10">
@@ -274,7 +274,7 @@
   </style>
 </head>
 <body>
-  <div class="ver">v10.5 原生字幕修復版</div>
+  <div class="ver">v10.6 雙向字幕完整修復版</div>
   
   <details>
     <summary>📊 系統狀態燈號</summary>
@@ -322,7 +322,7 @@
 
   <div class="chat-box" id="chatBox">
     <div class="chat-msg" style="color:#607d8b; text-align:center; font-size:12px;">
-      --- 廣東話即時字幕 (按住通話自動顯示) ---
+      --- 廣東話即時字幕 (PC / 手機雙向同步) ---
     </div>
   </div>
 
@@ -366,7 +366,7 @@
     let recognition = null;
     let sttEnabled = true;
     let currentTranscript = "";
-    let recognitionRunning = false;
+    let recognitionActive = false;
 
     const initBtn = document.getElementById('initBtn');
     const pttBtn = document.getElementById('pttBtn');
@@ -493,7 +493,7 @@
     updateDebug();
 
     // ====================================================
-    // 原生廣東話語音辨識（即時且安全防卡死）
+    // 原生廣東話語音辨識（PC Chrome + iOS 雙平台相容）
     // ====================================================
     function initSpeechRecognition() {
       if (!SpeechRecognition) {
@@ -509,7 +509,7 @@
       recognition.interimResults = true;
 
       recognition.onstart = () => {
-        recognitionRunning = true;
+        recognitionActive = true;
         sttBadge.innerText = "粵語字幕: 聽寫中...";
         sttBadge.className = "badge ok";
       };
@@ -518,39 +518,43 @@
         let interim = "";
         let finalStr = "";
         for (let i = 0; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
+          const res = event.results[i];
+          const transcript = res[0].transcript;
+          if (res.isFinal) {
             finalStr += transcript;
           } else {
             interim += transcript;
           }
         }
         currentTranscript = (finalStr + interim).trim();
-        if (currentTranscript) {
+        // 只要用戶正在通話（或者啱啱放手未送出），就實時發布文字
+        if (currentTranscript && (isTalking || recognitionActive)) {
           upsertChatMessage(MY_ID_HEX, currentTranscript, false, true);
           publishTextSubtitle(currentTranscript, false);
         }
       };
 
       recognition.onerror = (e) => {
-        console.warn("STT Error:", e.error);
         if (e.error === 'not-allowed') {
-          sttBadge.innerText = "粵語字幕: 未授權辨識";
+          sttBadge.innerText = "粵語字幕: 權限遭拒";
           sttBadge.className = "badge off";
         } else if (e.error !== 'no-speech' && e.error !== 'aborted') {
-          sttBadge.innerText = "粵語字幕: " + e.error;
-          sttBadge.className = "badge warn";
+          console.warn("STT warning:", e.error);
         }
       };
 
       recognition.onend = () => {
-        recognitionRunning = false;
+        recognitionActive = false;
+        // 如果放開掣後仲有文字未發送做 Final，即時送出
         if (currentTranscript) {
           upsertChatMessage(MY_ID_HEX, currentTranscript, true, true);
           publishTextSubtitle(currentTranscript, true);
           currentTranscript = "";
         }
-        if (sttEnabled) {
+        // 如果通話中途被 Chrome 自動斷開，即刻重連
+        if (isTalking && sttEnabled) {
+          try { recognition.start(); } catch (err) {}
+        } else if (sttEnabled) {
           sttBadge.innerText = "粵語字幕: 就緒";
           sttBadge.className = "badge ok";
         }
@@ -599,7 +603,7 @@
         sttBadge.innerText = "粵語字幕: 就緒";
         sttBadge.className = "badge ok";
       } else {
-        if (recognition && recognitionRunning) {
+        if (recognition && recognitionActive) {
           try { recognition.stop(); } catch (e) {}
         }
         toggleSttBtn.innerText = "字幕: 關閉";
@@ -845,7 +849,7 @@
         if (isTalking) stopTalking();
       });
 
-      // 接收端：文字與語音分流
+      // 接收端：文字與音訊分流
       client.on('message', (topic, payload) => {
         if (topic === currentTextTopic) {
           try {
@@ -1022,11 +1026,12 @@
 
       playRogerBeep(1500, 45);
 
-      // 【核心修復】：在用戶 Touch / MouseDown 當下直接 start recognition
-      // 滿足 Safari User Gesture 需求，避免被 iOS 攔截阻擋
-      if (sttEnabled && recognition && !recognitionRunning) {
+      // 啟動原生廣東話聽寫
+      if (sttEnabled && recognition) {
         try {
-          recognition.start();
+          if (!recognitionActive) {
+            recognition.start();
+          }
         } catch (e) {
           console.warn("Recognition start skipped:", e);
         }
@@ -1075,11 +1080,16 @@
 
       playRogerBeep(1050, 60);
 
-      // 發話結束時停止語音辨識，觸發 onresult 產生 final 字句
-      if (recognition && recognitionRunning) {
-        try {
-          recognition.stop();
-        } catch (e) {}
+      // 電腦 Chrome 特有延遲安全關閉：
+      // 延遲 300ms 先 stop，確保 Google 語音辨識伺服器最後一個 final 封包順利回傳並發布
+      if (recognition && recognitionActive) {
+        setTimeout(() => {
+          if (!isTalking && recognition && recognitionActive) {
+            try {
+              recognition.stop();
+            } catch (e) {}
+          }
+        }, 300);
       }
     }
   </script>
