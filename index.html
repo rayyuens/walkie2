@@ -124,6 +124,49 @@
       color: #84ffff;
       background: rgba(0, 229, 255, 0.1);
     }
+    /* 密碼輸入框與音量控制拉尺樣式 */
+    .pwd-row, .vol-row {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: #1c2026;
+      border: 1px solid #37474f;
+      padding: 7px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #eceff1;
+      box-sizing: border-box;
+    }
+    .pwd-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: #00e5ff;
+      font-size: 13px;
+      font-family: monospace;
+      outline: none;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    .pwd-input::placeholder {
+      color: #78909c;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .vol-row input[type="range"] {
+      flex: 1;
+      accent-color: #00e5ff;
+      cursor: pointer;
+      height: 6px;
+    }
+    .vol-val {
+      min-width: 42px;
+      text-align: right;
+      color: #00e5ff;
+      font-family: monospace;
+    }
     .status {
       margin-bottom: 14px;
       font-size: 14px;
@@ -239,6 +282,7 @@
       <div class="badge" id="netBadge">網絡: 待命</div>
       <div class="badge" id="micBadge">麥克風: 未授權</div>
       <div class="badge" id="sttBadge">粵語字幕: 待命</div>
+      <div class="badge warn" id="secBadge">密碼鎖: 公開模式</div>
     </div>
   </details>
   <!-- 預設摺疊：頻道與音訊選項（連線後才顯示） -->
@@ -253,10 +297,21 @@
       </select>
       <button class="ctrl-btn mic-on" id="toggleMicBtn">停止麥克風</button>
       <button class="ctrl-btn stt-on" id="toggleSttBtn">字幕: 開啟</button>
+      <!-- 零延遲同步密碼鎖輸入框 -->
+      <div class="pwd-row">
+        <span>🔑 密碼</span>
+        <input type="password" id="channelPasswordInput" class="pwd-input" placeholder="輸入私人密碼防干擾 (留空為公開)">
+      </div>
+      <!-- 接收音量控制 Bar -->
+      <div class="vol-row">
+        <span>🔊 音量</span>
+        <input type="range" id="volSlider" min="0" max="200" value="100" step="5">
+        <span class="vol-val" id="volValue">100%</span>
+      </div>
     </div>
   </details>
   <div class="status" id="statusText">請點擊下方按鈕啟動音訊與廣東話字幕</div>
-  <button id="initBtn">1. 啟用全天候對講機</button>
+  <button id="initBtn">啟用全天候對講機</button>
   <button id="pttBtn">按住通話 (PTT)</button>
   <!-- 廣東話即時字幕紀錄區 -->
   <div class="chat-box" id="chatBox">
@@ -267,13 +322,17 @@
   <div class="debug" id="debugText">本機 ID: ---- | TX: 0 | RX: 0</div>
   <script>
     const MQTT_BROKER = "wss://broker.hivemq.com:8884/mqtt";
-    let currentTopic = "ray_walkie_hk/ch1";
+    let baseTopic = "ray_walkie_hk/ch1";
+    let topicSecretSuffix = "";
+    let currentTopic = baseTopic;
     let currentTextTopic = currentTopic + "/text";
     const TARGET_RATE = 16000;
     const MY_ID = Math.floor(Math.random() * 0xFFFFFFFF) >>> 0;
     const MY_ID_HEX = MY_ID.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
     let client = null;
     let audioCtx = null;
+    let rxGainNode = null;
+    let rxVolume = 1.0;
     let micStream = null;
     let micEnabled = false;
     let scriptNode = null;
@@ -286,6 +345,10 @@
     let txCount = 0;
     let rxCount = 0;
     let rxTimeout = null;
+    // 零延遲同步密碼鎖變數（唔用 async WebCrypto，100% 唔會拖慢舊手機 CPU 或搞亂封包順序）
+    const DEFAULT_MAGIC = 0x52574B31; // 公開模式識別碼
+    let currentMagic = DEFAULT_MAGIC;
+    let cipherMask = null;
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     let recognition = null;
     let sttEnabled = true;
@@ -298,11 +361,92 @@
     const netBadge = document.getElementById('netBadge');
     const micBadge = document.getElementById('micBadge');
     const sttBadge = document.getElementById('sttBadge');
+    const secBadge = document.getElementById('secBadge');
     const controlsDetails = document.getElementById('controlsDetails');
     const channelSelect = document.getElementById('channelSelect');
     const toggleMicBtn = document.getElementById('toggleMicBtn');
     const toggleSttBtn = document.getElementById('toggleSttBtn');
+    const channelPasswordInput = document.getElementById('channelPasswordInput');
+    const volSlider = document.getElementById('volSlider');
+    const volValue = document.getElementById('volValue');
     const chatBox = document.getElementById('chatBox');
+    // ====================================================
+    // 零延遲同步密碼計算（0ms 同步執行，完全不阻塞音訊流）
+    // ====================================================
+    function fnv1a32(str) {
+      let h = 0x811c9dc5;
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+      }
+      return h >>> 0;
+    }
+    function refreshSubscriptionTopics() {
+      const newTopic = baseTopic + topicSecretSuffix;
+      const newTextTopic = newTopic + "/text";
+      if (client && client.connected) {
+        if (currentTopic !== newTopic) {
+          client.unsubscribe(currentTopic);
+          client.unsubscribe(currentTextTopic);
+          currentTopic = newTopic;
+          currentTextTopic = newTextTopic;
+          client.subscribe(currentTopic, { qos: 0 });
+          client.subscribe(currentTextTopic, { qos: 0 });
+        }
+      } else {
+        currentTopic = newTopic;
+        currentTextTopic = newTextTopic;
+      }
+    }
+    function applyChannelPassword(pwd) {
+      if (!pwd) {
+        currentMagic = DEFAULT_MAGIC;
+        cipherMask = null;
+        topicSecretSuffix = "";
+        refreshSubscriptionTopics();
+        secBadge.innerText = "密碼鎖: 公開模式";
+        secBadge.className = "badge warn";
+        return;
+      }
+      // 1. 產生專屬 Topic 後綴與 32-bit 封包簽名碼
+      const roomHash = fnv1a32("room_topic_" + pwd).toString(16).padStart(8, '0');
+      topicSecretSuffix = "/ lock_" + roomHash;
+      currentMagic = fnv1a32("packet_magic_" + pwd);
+      if (currentMagic === DEFAULT_MAGIC) currentMagic ^= 0x12345678;
+      // 2. 產生 64-byte 高速同步遮罩表
+      cipherMask = new Uint8Array(64);
+      let seed = fnv1a32("mask_seed_" + pwd);
+      for (let i = 0; i < 64; i++) {
+        seed ^= seed << 13;
+        seed ^= seed >>> 17;
+        seed ^= seed << 5;
+        cipherMask[i] = (seed >>> 0) & 0xFF;
+      }
+      refreshSubscriptionTopics();
+      secBadge.innerText = "密碼鎖: 已鎖定";
+      secBadge.className = "badge ok";
+    }
+    // 讀取已儲存密碼
+    const savedPwd = localStorage.getItem('walkie_channel_pwd') || '';
+    if (savedPwd) {
+      channelPasswordInput.value = savedPwd;
+      applyChannelPassword(savedPwd);
+    }
+    channelPasswordInput.addEventListener('input', () => {
+      const pwd = channelPasswordInput.value.trim();
+      localStorage.setItem('walkie_channel_pwd', pwd);
+      applyChannelPassword(pwd);
+      statusText.innerText = pwd ? "🔒 已鎖定私人密碼頻道（零延遲同步模式）" : "🔓 目前為公開頻道（未設密碼）";
+    });
+    // 音量控制拉尺事件
+    volSlider.oninput = () => {
+      const pct = parseInt(volSlider.value, 10);
+      volValue.innerText = pct + "%";
+      rxVolume = pct / 100.0;
+      if (rxGainNode && audioCtx) {
+        rxGainNode.gain.setValueAtTime(rxVolume, audioCtx.currentTime);
+      }
+    };
     const ULAW_DECODE = new Float32Array(256);
     (function initUlawTable() {
       for (let i = 0; i < 256; i++) {
@@ -380,6 +524,7 @@
     function publishTextSubtitle(text, isFinal) {
       if (!client || !client.connected || !text) return;
       const payload = JSON.stringify({
+        magic: currentMagic,
         sender: MY_ID_HEX,
         text: text,
         final: isFinal
@@ -427,7 +572,7 @@
         const gain = audioCtx.createGain();
         osc.type = 'sine';
         osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
-        gain.gain.setValueAtTime(0.08, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.08 * rxVolume, audioCtx.currentTime);
         gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + durationMs / 1000);
         osc.connect(gain);
         gain.connect(audioCtx.destination);
@@ -483,17 +628,10 @@
       }
     };
     channelSelect.onchange = () => {
-      const newTopic = channelSelect.value;
-      if (client && client.connected && newTopic !== currentTopic) {
-        client.unsubscribe(currentTopic);
-        client.unsubscribe(currentTextTopic);
-        currentTopic = newTopic;
-        currentTextTopic = currentTopic + "/text";
-        client.subscribe(currentTopic, { qos: 0 });
-        client.subscribe(currentTextTopic, { qos: 0 });
-        playRogerBeep(1500, 50);
-        statusText.innerText = `已切換至 ${channelSelect.options[channelSelect.selectedIndex].text}`;
-      }
+      baseTopic = channelSelect.value;
+      refreshSubscriptionTopics();
+      playRogerBeep(1500, 50);
+      statusText.innerText = `已切換至 ${channelSelect.options[channelSelect.selectedIndex].text}`;
     };
     async function requestWakeLock() {
       if ('wakeLock' in navigator) {
@@ -549,7 +687,11 @@
         return;
       }
       initSpeechRecognition();
+      applyChannelPassword(channelPasswordInput.value.trim());
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      rxGainNode = audioCtx.createGain();
+      rxGainNode.gain.value = rxVolume;
+      rxGainNode.connect(audioCtx.destination);
       await ensureAudioActive();
       startAudioKeepAlive();
       await requestWakeLock();
@@ -566,7 +708,7 @@
         netBadge.className = "badge ok";
         pttBtn.classList.remove('offline');
         initBtn.style.display = 'none';
-        controlsDetails.style.display = 'block'; // 連線後顯示頻道與設定選單
+        controlsDetails.style.display = 'block';
         pttBtn.style.display = 'block';
         chatBox.style.display = 'block';
         client.subscribe(currentTopic, { qos: 0 });
@@ -584,35 +726,63 @@
         pttBtn.classList.add('offline');
         if (isTalking) stopTalking();
       });
+      // 100% 同步接收處理（無 async/await，保證舊手機封包次序絕對唔亂、聲音唔變矇）
       client.on('message', (topic, payload) => {
         if (topic === currentTextTopic) {
           try {
             const data = JSON.parse(new TextDecoder().decode(payload));
-            if (data.sender && data.sender !== MY_ID_HEX && data.text) {
+            if (data.magic === currentMagic && data.sender && data.sender !== MY_ID_HEX && data.text) {
               upsertChatMessage(data.sender, data.text, data.final, false);
             }
           } catch (e) {}
           return;
         }
-        if (topic !== currentTopic || isTalking || payload.byteLength <= 4) return;
+        if (topic !== currentTopic || isTalking || payload.byteLength <= 8) return;
         const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
-        const senderId = view.getUint32(0, true);
+        const packetMagic = view.getUint32(0, true);
+        // 密碼鎖驗證：如果密碼唔啱，直接 return，100% 零雜音！
+        if (packetMagic !== currentMagic) return;
+        const senderId = view.getUint32(4, true);
         if (senderId === MY_ID) return;
         rxCount++;
         updateDebug();
+        // 關鍵修復：收聽期間暫時將本機麥克風 Track 靜音，防止舊手機觸發硬件回音消除 (AEC Ducking) 將後半句聲音壓細變矇！
+        if (micStream && !isTalking) {
+          const tracks = micStream.getAudioTracks();
+          for (let i = 0; i < tracks.length; i++) {
+            if (tracks[i].enabled) tracks[i].enabled = false;
+          }
+        }
         pttBtn.classList.add('receiving');
         pttBtn.innerText = "對方講話中...";
         statusText.innerText = `正在接收來自 [${senderId.toString(16).toUpperCase().padStart(8, '0').slice(0, 4)}] 的語音...`;
         clearTimeout(rxTimeout);
         rxTimeout = setTimeout(() => {
           if (!isTalking) {
+            // 對面講完嘢，自動恢復本機麥克風 Track 待命
+            if (micStream && micEnabled) {
+              const tracks = micStream.getAudioTracks();
+              for (let i = 0; i < tracks.length; i++) {
+                tracks[i].enabled = true;
+              }
+            }
             pttBtn.classList.remove('receiving');
             pttBtn.innerText = micEnabled ? "按住通話 (PTT)" : "純收聽模式\n(已關閉麥克風)";
             statusText.innerText = micEnabled ? "已連線！放開收聽，按住通話" : "純收聽模式待命中";
             playRogerBeep(1150, 70);
           }
         }, 350);
-        playIncomingUlaw(new Uint8Array(payload.buffer, payload.byteOffset + 4, payload.byteLength - 4));
+        const audioLen = payload.byteLength - 8;
+        const audioBytes = new Uint8Array(audioLen);
+        const srcBytes = new Uint8Array(payload.buffer, payload.byteOffset + 8, audioLen);
+        if (cipherMask) {
+          for (let i = 0; i < audioLen; i++) {
+            audioBytes[i] = srcBytes[i] ^ cipherMask[i & 63];
+          }
+        } else {
+          audioBytes.set(srcBytes);
+        }
+        playIncomingUlaw(audioBytes);
       });
     };
     function playIncomingUlaw(ulawBytes) {
@@ -642,7 +812,7 @@
       audioBuffer.copyToChannel(upsampled, 0);
       const source = audioCtx.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(audioCtx.destination);
+      source.connect(rxGainNode || audioCtx.destination);
       const now = audioCtx.currentTime;
       if (nextStartTime < now || (nextStartTime - now) > 0.16) {
         nextStartTime = now + 0.04;
@@ -653,9 +823,10 @@
     function encodeAudioPacket(float32Buffer, inputRate) {
       const ratio = inputRate / TARGET_RATE;
       const sampleCount = Math.floor(float32Buffer.length / ratio);
-      const packet = new Uint8Array(4 + sampleCount);
+      const packet = new Uint8Array(8 + sampleCount);
       const view = new DataView(packet.buffer);
-      view.setUint32(0, MY_ID, true);
+      view.setUint32(0, currentMagic, true);
+      view.setUint32(4, MY_ID, true);
       for (let i = 0; i < sampleCount; i++) {
         const start = Math.floor(i * ratio);
         const end = Math.min(Math.floor((i + 1) * ratio), float32Buffer.length);
@@ -673,7 +844,8 @@
         }
         let clamped = Math.max(-1, Math.min(1, avg));
         let int16 = clamped < 0 ? (clamped * 32768) : (clamped * 32767);
-        packet[4 + i] = linearToUlaw(int16 | 0);
+        const ulawByte = linearToUlaw(int16 | 0);
+        packet[8 + i] = cipherMask ? (ulawByte ^ cipherMask[i & 63]) : ulawByte;
       }
       return packet;
     }
@@ -688,6 +860,11 @@
         return;
       }
       if (!client || !client.connected || isTalking) return;
+      // 確保發話時麥克風 Track 處於開啟狀態
+      const tracks = micStream.getAudioTracks();
+      for (let i = 0; i < tracks.length; i++) {
+        tracks[i].enabled = true;
+      }
       isTalking = true;
       currentTranscript = "";
       pttBtn.classList.remove('receiving');
@@ -703,6 +880,7 @@
       scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
       silencer = audioCtx.createGain();
       silencer.gain.value = 0;
+      // 100% 同步發送，無 async 延遲
       scriptNode.onaudioprocess = (e) => {
         if (!isTalking || !client.connected) return;
         const inputData = e.inputBuffer.getChannelData(0);
