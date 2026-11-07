@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.2 舊iPhone修復版</title>
+  <title>Web 對講機 - v10.3 PWA 摺疊版</title>
   
   <!-- PWA Manifest 內嵌支援 -->
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
@@ -99,7 +99,7 @@
       gap: 8px;
       padding: 10px;
     }
-    select, .ctrl-btn, .api-input {
+    select, .ctrl-btn {
       background: #1c2026;
       color: #eceff1;
       border: 1px solid #37474f;
@@ -108,16 +108,6 @@
       font-size: 13px;
       font-weight: 600;
       cursor: pointer;
-    }
-    .api-input {
-      width: 100%;
-      box-sizing: border-box;
-      font-weight: normal;
-      font-family: monospace;
-      font-size: 12px;
-      cursor: text;
-      user-select: text;
-      -webkit-user-select: text;
     }
     .ctrl-btn.mic-on {
       border-color: #ff5252;
@@ -240,7 +230,7 @@
 </head>
 <body>
 
-  <div class="ver">v10.2 PWA 摺疊版 (舊iPhone無損音質字幕修復)</div>
+  <div class="ver">v10.3 PWA 摺疊版</div>
   
   <!-- 預設摺疊：狀態燈號 -->
   <details>
@@ -265,7 +255,6 @@
       </select>
       <button class="ctrl-btn mic-on" id="toggleMicBtn">停止麥克風</button>
       <button class="ctrl-btn stt-on" id="toggleSttBtn">字幕: 開啟</button>
-      <input type="password" id="groqKeyInput" class="api-input" placeholder="選填 Groq API Key (gsk_...) 啟用舊iPhone放手即轉字幕">
     </div>
   </details>
 
@@ -276,7 +265,7 @@
   <!-- 廣東話即時字幕紀錄區 -->
   <div class="chat-box" id="chatBox">
     <div class="chat-msg" style="color:#607d8b; text-align:center; font-size:12px;">
-      --- 廣東話即時對話字幕 (共用單一音源・零搶咪衝突) ---
+      --- 廣東話即時對話字幕 (按住 PTT 講話自動辨識) ---
     </div>
   </div>
 
@@ -291,7 +280,7 @@
     const MY_ID = Math.floor(Math.random() * 0xFFFFFFFF) >>> 0;
     const MY_ID_HEX = MY_ID.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
 
-    // 偵測係咪 iOS / iPadOS 裝置 (舊 iPhone 嚴禁喺 PTT 期間行 webkitSpeechRecognition)
+    // 偵測係咪 iPhone / iPad：因為 iOS WebKit 一開 SpeechRecognition 就會將傳聲 Stream 靜音
     const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || 
                    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
@@ -310,13 +299,16 @@
     let rxCount = 0;
     let rxTimeout = null;
 
-    // 方法二：重用原本語音流嘅 Buffer 陣列 (100% 唔影響原本語音編碼與傳送)
-    let sttInt16Chunks = [];
+    // 紀錄當前收聽緊邊部機講嘢（如果對方係舊 iPhone 無開本機聽寫，接收端可順手代轉字幕）
+    let activeRemoteSpeaker = null;
+    let remoteHasSentText = false;
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     let recognition = null;
     let sttEnabled = true;
+    let sttRunning = false;
     let currentTranscript = "";
+    let sttTargetSender = MY_ID_HEX;
 
     const initBtn = document.getElementById('initBtn');
     const pttBtn = document.getElementById('pttBtn');
@@ -330,15 +322,7 @@
     const channelSelect = document.getElementById('channelSelect');
     const toggleMicBtn = document.getElementById('toggleMicBtn');
     const toggleSttBtn = document.getElementById('toggleSttBtn');
-    const groqKeyInput = document.getElementById('groqKeyInput');
     const chatBox = document.getElementById('chatBox');
-
-    // 載入已儲存嘅 Groq API Key (如有)
-    groqKeyInput.value = localStorage.getItem('walkie_groq_key') || '';
-    groqKeyInput.onchange = () => {
-      localStorage.setItem('walkie_groq_key', groqKeyInput.value.trim());
-      updateSttBadgeStatus();
-    };
 
     const ULAW_DECODE = new Float32Array(256);
     (function initUlawTable() {
@@ -371,154 +355,70 @@
     }
     updateDebug();
 
-    function updateSttBadgeStatus() {
-      if (!sttEnabled) {
-        sttBadge.innerText = "粵語字幕: 已關閉";
+    function initSpeechRecognition() {
+      if (!SpeechRecognition) {
+        sttBadge.innerText = "粵語字幕: 瀏覽器不支援";
         sttBadge.className = "badge off";
+        toggleSttBtn.style.display = 'none';
         return;
       }
-      const hasGroq = groqKeyInput.value.trim().startsWith('gsk_');
-      if (hasGroq) {
-        sttBadge.innerText = "粵語字幕: 同源語音Blob模式 (零衝突)";
+
+      recognition = new SpeechRecognition();
+      recognition.lang = 'zh-HK';
+      recognition.continuous = true;
+      recognition.interimResults = true;
+
+      recognition.onstart = () => {
+        sttRunning = true;
+        sttBadge.innerText = "粵語字幕: 聽寫中...";
         sttBadge.className = "badge ok";
-      } else if (IS_IOS) {
-        sttBadge.innerText = "粵語字幕: iOS護航 (防搶咪已啟用)";
-        sttBadge.className = "badge ok";
-      } else if (SpeechRecognition) {
-        sttBadge.innerText = "粵語字幕: 就緒";
-        sttBadge.className = "badge ok";
-      } else {
-        sttBadge.innerText = "粵語字幕: 需填 API Key";
-        sttBadge.className = "badge warn";
-      }
-    }
-
-    function initSpeechRecognition() {
-      // 如果係非 iOS 裝置（如 Android / PC）而且無填 Groq Key，先至初始化 Web Speech API
-      // 喺舊 iPhone 上面徹底禁止啟動 webkitSpeechRecognition，防止 iOS 搶走麥克風搞到無聲！
-      if (!IS_IOS && SpeechRecognition) {
-        recognition = new SpeechRecognition();
-        recognition.lang = 'zh-HK';
-        recognition.continuous = true;
-        recognition.interimResults = true;
-
-        recognition.onstart = () => {
-          sttBadge.innerText = "粵語字幕: 聽寫中...";
-          sttBadge.className = "badge ok";
-        };
-
-        recognition.onresult = (event) => {
-          if (groqKeyInput.value.trim().startsWith('gsk_')) return; // 有 Groq Key 優先用方法二 Blob
-          let interim = "";
-          let finalStr = "";
-          for (let i = 0; i < event.results.length; i++) {
-            const transcript = event.results[i][0].transcript;
-            if (event.results[i].isFinal) {
-              finalStr += transcript;
-            } else {
-              interim += transcript;
-            }
-          }
-          currentTranscript = (finalStr + interim).trim();
-          if (currentTranscript) {
-            upsertChatMessage(MY_ID_HEX, currentTranscript, false, true);
-            publishTextSubtitle(currentTranscript, false);
-          }
-        };
-
-        recognition.onerror = () => {};
-        recognition.onend = () => { updateSttBadgeStatus(); };
-      }
-      updateSttBadgeStatus();
-    }
-
-    // =========================================================
-    // 方法二核心：將原本傳聲用完嘅 16kHz PCM 直接打包成 WAV Blob 轉字幕
-    // 100% 唔會再 call getUserMedia 或 webkitSpeechRecognition 搶咪
-    // =========================================================
-    function buildWavBlobFromChunks(chunks, sampleRate) {
-      let totalSamples = 0;
-      for (const c of chunks) totalSamples += c.length;
-      if (totalSamples < sampleRate * 0.25) return null; // 短過 0.25 秒唔轉
-
-      const wavBuffer = new ArrayBuffer(44 + totalSamples * 2);
-      const view = new DataView(wavBuffer);
-
-      const writeStr = (offset, str) => {
-        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
       };
 
-      writeStr(0, 'RIFF');
-      view.setUint32(4, 36 + totalSamples * 2, true);
-      writeStr(8, 'WAVE');
-      writeStr(12, 'fmt ');
-      view.setUint32(16, 16, true);
-      view.setUint16(20, 1, true); // PCM
-      view.setUint16(22, 1, true); // Mono
-      view.setUint32(24, sampleRate, true);
-      view.setUint32(28, sampleRate * 2, true);
-      view.setUint16(32, 2, true);
-      view.setUint16(34, 16, true);
-      writeStr(36, 'data');
-      view.setUint32(40, totalSamples * 2, true);
+      recognition.onresult = (event) => {
+        // 如果係幫對面舊 iPhone 代聽緊，但對面已經自己有發字幕過嚟，就唔覆蓋
+        if (sttTargetSender !== MY_ID_HEX && remoteHasSentText) return;
 
-      let offset = 44;
-      for (const c of chunks) {
-        for (let i = 0; i < c.length; i++, offset += 2) {
-          view.setInt16(offset, c[i], true);
-        }
-      }
-      return new Blob([wavBuffer], { type: 'audio/wav' });
-    }
-
-    async function transcribeVoiceBlobToSubtitle(wavBlob) {
-      const apiKey = groqKeyInput.value.trim();
-      if (!apiKey || !wavBlob) return;
-
-      try {
-        sttBadge.innerText = "粵語字幕: 轉換中...";
-        upsertChatMessage(MY_ID_HEX, "（辨識緊廣東話字幕...）", false, true);
-
-        const formData = new FormData();
-        formData.append('file', wavBlob, 'ptt.wav');
-        formData.append('model', 'whisper-large-v3-turbo');
-        formData.append('language', 'yue'); // 指定粵語
-        formData.append('response_format', 'json');
-
-        const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${apiKey}` },
-          body: formData
-        });
-
-        if (res.ok) {
-          const data = await res.json();
-          const text = (data.text || "").trim();
-          if (text) {
-            upsertChatMessage(MY_ID_HEX, text, true, true);
-            publishTextSubtitle(text, true);
+        let interim = "";
+        let finalStr = "";
+        for (let i = 0; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalStr += transcript;
           } else {
-            removeInterimChatMessage(MY_ID_HEX);
+            interim += transcript;
           }
-        } else {
-          removeInterimChatMessage(MY_ID_HEX);
         }
-      } catch (e) {
-        removeInterimChatMessage(MY_ID_HEX);
-      } finally {
-        updateSttBadgeStatus();
-      }
+        currentTranscript = (finalStr + interim).trim();
+        if (currentTranscript) {
+          const isMe = (sttTargetSender === MY_ID_HEX);
+          upsertChatMessage(sttTargetSender, currentTranscript, false, isMe);
+          publishTextSubtitle(sttTargetSender, currentTranscript, false);
+        }
+      };
+
+      recognition.onerror = (e) => {
+        if (e.error !== 'no-speech' && e.error !== 'aborted') {
+          sttBadge.innerText = "粵語字幕: " + e.error;
+          sttBadge.className = "badge warn";
+        }
+      };
+
+      recognition.onend = () => {
+        sttRunning = false;
+        if (sttEnabled) {
+          sttBadge.innerText = IS_IOS ? "粵語字幕: 就緒 (iOS防搶咪)" : "粵語字幕: 就緒";
+          sttBadge.className = "badge ok";
+        }
+      };
+
+      sttBadge.innerText = IS_IOS ? "粵語字幕: 就緒 (iOS防搶咪)" : "粵語字幕: 就緒";
+      sttBadge.className = "badge ok";
     }
 
-    function removeInterimChatMessage(senderHex) {
-      const el = document.getElementById("interim_" + senderHex);
-      if (el) el.remove();
-    }
-
-    function publishTextSubtitle(text, isFinal) {
+    function publishTextSubtitle(senderHex, text, isFinal) {
       if (!client || !client.connected || !text) return;
       const payload = JSON.stringify({
-        sender: MY_ID_HEX,
+        sender: senderHex,
         text: text,
         final: isFinal
       });
@@ -554,12 +454,15 @@
       if (sttEnabled) {
         toggleSttBtn.innerText = "字幕: 開啟";
         toggleSttBtn.className = "ctrl-btn stt-on";
+        sttBadge.innerText = IS_IOS ? "粵語字幕: 就緒 (iOS防搶咪)" : "粵語字幕: 就緒";
+        sttBadge.className = "badge ok";
       } else {
-        if (recognition) { try { recognition.stop(); } catch (e) {} }
+        if (recognition && sttRunning) { try { recognition.stop(); } catch (e) {} }
         toggleSttBtn.innerText = "字幕: 關閉";
         toggleSttBtn.className = "ctrl-btn";
+        sttBadge.innerText = "粵語字幕: 已關閉";
+        sttBadge.className = "badge off";
       }
-      updateSttBadgeStatus();
     };
 
     function playRogerBeep(freq = 1250, durationMs = 65) {
@@ -578,7 +481,6 @@
       } catch (e) {}
     }
 
-    // 語音麥克風設定：100% 保持原樣，一粒字都無改
     async function enableMicrophone() {
       try {
         micStream = await navigator.mediaDevices.getUserMedia({
@@ -595,7 +497,7 @@
         toggleMicBtn.className = "ctrl-btn mic-on";
         pttBtn.classList.remove('disabled-mic');
         pttBtn.innerText = "按住通話 (PTT)";
-        statusText.innerText = "麥克風已啟用！按住紅掣講廣東話即傳聲及出字幕";
+        statusText.innerText = "麥克風已啟用！按住紅掣講廣東話即出字幕";
         return true;
       } catch (err) {
         statusText.innerText = "麥克風授權失敗: " + err.message;
@@ -747,28 +649,46 @@
       });
 
       client.on('message', (topic, payload) => {
+        // 1. 收到字幕訊息：無論開關都會即時顯示喺字幕框
         if (topic === currentTextTopic) {
           try {
             const data = JSON.parse(new TextDecoder().decode(payload));
-            if (data.sender && data.sender !== MY_ID_HEX && data.text) {
-              upsertChatMessage(data.sender, data.text, data.final, false);
+            if (data.sender && data.text) {
+              if (data.sender !== MY_ID_HEX) {
+                remoteHasSentText = true;
+              }
+              const isMe = (data.sender === MY_ID_HEX);
+              upsertChatMessage(data.sender, data.text, data.final, isMe);
             }
           } catch (e) {}
           return;
         }
 
+        // 2. 收到語音封包：100% 原裝邏輯
         if (topic !== currentTopic || isTalking || payload.byteLength <= 4) return;
 
         const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
         const senderId = view.getUint32(0, true);
         if (senderId === MY_ID) return;
 
+        const senderHex = senderId.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
         rxCount++;
         updateDebug();
 
+        // 如果係新一段接收（例如舊 iPhone 講緊嘢過嚟），非 iOS 接收端可以順手幫手聽寫出字幕
+        if (activeRemoteSpeaker !== senderHex) {
+          activeRemoteSpeaker = senderHex;
+          remoteHasSentText = false;
+          currentTranscript = "";
+          if (sttEnabled && !IS_IOS && recognition && !sttRunning) {
+            sttTargetSender = senderHex;
+            try { recognition.start(); } catch (e) {}
+          }
+        }
+
         pttBtn.classList.add('receiving');
         pttBtn.innerText = "對方講話中...";
-        statusText.innerText = `正在接收來自 [${senderId.toString(16).toUpperCase().padStart(8, '0').slice(0, 4)}] 的語音...`;
+        statusText.innerText = `正在接收來自 [${senderHex}] 的語音...`;
         clearTimeout(rxTimeout);
         rxTimeout = setTimeout(() => {
           if (!isTalking) {
@@ -776,14 +696,25 @@
             pttBtn.innerText = micEnabled ? "按住通話 (PTT)" : "純收聽模式\n(已關閉麥克風)";
             statusText.innerText = micEnabled ? "已連線！放開收聽，按住通話" : "純收聽模式待命中";
             playRogerBeep(1150, 70);
+
+            if (activeRemoteSpeaker) {
+              if (recognition && sttRunning && sttTargetSender === activeRemoteSpeaker) {
+                try { recognition.stop(); } catch (e) {}
+              }
+              if (currentTranscript && !remoteHasSentText) {
+                upsertChatMessage(activeRemoteSpeaker, currentTranscript, true, false);
+                publishTextSubtitle(activeRemoteSpeaker, currentTranscript, true);
+                currentTranscript = "";
+              }
+              activeRemoteSpeaker = null;
+            }
           }
-        }, 350);
+        }, 450);
 
         playIncomingUlaw(new Uint8Array(payload.buffer, payload.byteOffset + 4, payload.byteLength - 4));
       });
     };
 
-    // 接收端語音解碼與播放：100% 保持原樣，完全唔郁
     function playIncomingUlaw(ulawBytes) {
       if (!audioCtx) return;
       if (audioCtx.state !== 'running') audioCtx.resume();
@@ -828,16 +759,12 @@
       nextStartTime += audioBuffer.duration;
     }
 
-    // 發送端語音編碼：100% 保持原樣，算術與增益完全唔郁
-    // 只係順手將算好嘅 int16 儲多一份落 sttInt16Chunks 供放手後轉字幕
     function encodeAudioPacket(float32Buffer, inputRate) {
       const ratio = inputRate / TARGET_RATE;
       const sampleCount = Math.floor(float32Buffer.length / ratio);
       const packet = new Uint8Array(4 + sampleCount);
       const view = new DataView(packet.buffer);
       view.setUint32(0, MY_ID, true);
-
-      const pcmChunk = sttEnabled ? new Int16Array(sampleCount) : null;
 
       for (let i = 0; i < sampleCount; i++) {
         const start = Math.floor(i * ratio);
@@ -858,12 +785,8 @@
 
         let clamped = Math.max(-1, Math.min(1, avg));
         let int16 = clamped < 0 ? (clamped * 32768) : (clamped * 32767);
-        const s16 = int16 | 0;
-        packet[4 + i] = linearToUlaw(s16);
-        if (pcmChunk) pcmChunk[i] = s16;
+        packet[4 + i] = linearToUlaw(int16 | 0);
       }
-
-      if (pcmChunk) sttInt16Chunks.push(pcmChunk);
       return packet;
     }
 
@@ -882,7 +805,7 @@
 
       isTalking = true;
       currentTranscript = "";
-      sttInt16Chunks = []; // 清空上一次嘅同源字幕 Buffer
+      sttTargetSender = MY_ID_HEX;
       pttBtn.classList.remove('receiving');
       pttBtn.classList.add('active');
       pttBtn.innerText = "正在廣播中...";
@@ -891,10 +814,10 @@
       ensureAudioActive();
       playRogerBeep(1500, 45);
 
-      // 關鍵修復：只有非 iOS 且無用 Groq Blob 時先啟動 recognition
-      // 舊 iPhone 絕對唔會喺呢度 call recognition.start()，保住 100% 傳聲音質！
-      const hasGroq = groqKeyInput.value.trim().startsWith('gsk_');
-      if (sttEnabled && !IS_IOS && !hasGroq && recognition) {
+      // 核心修復：
+      // 非 iOS 裝置（Android / PC）按住 PTT 照常直接啟動 recognition 出字幕。
+      // iOS 裝置（舊 iPhone）按住 PTT 時絕對唔 call recognition.start()，等語音 100% 傳出去唔會無聲！
+      if (sttEnabled && !IS_IOS && recognition) {
         try { recognition.start(); } catch (e) {}
       }
 
@@ -935,20 +858,12 @@
         silencer = null;
       }
 
-      if (recognition) {
+      if (recognition && sttRunning) {
         try { recognition.stop(); } catch (e) {}
       }
-
-      // 方法二：放開 PTT 時，直接將剛剛傳聲用完嘅同一份 PCM 打包成 WAV Blob 送去轉字幕
-      if (sttEnabled && sttInt16Chunks.length > 0 && groqKeyInput.value.trim().startsWith('gsk_')) {
-        const wavBlob = buildWavBlobFromChunks(sttInt16Chunks, TARGET_RATE);
-        sttInt16Chunks = [];
-        if (wavBlob) {
-          transcribeVoiceBlobToSubtitle(wavBlob);
-        }
-      } else if (currentTranscript) {
+      if (currentTranscript) {
         upsertChatMessage(MY_ID_HEX, currentTranscript, true, true);
-        publishTextSubtitle(currentTranscript, true);
+        publishTextSubtitle(MY_ID_HEX, currentTranscript, true);
         currentTranscript = "";
       }
 
