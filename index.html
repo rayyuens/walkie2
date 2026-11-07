@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.4 PWA 摺疊版</title>
+  <title>Web 對講機 - v10.1 PWA 摺疊版</title>
   
   <!-- PWA Manifest 內嵌支援 -->
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
@@ -124,6 +124,34 @@
       color: #84ffff;
       background: rgba(0, 229, 255, 0.1);
     }
+    /* 音量控制拉尺樣式 */
+    .vol-row {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: #1c2026;
+      border: 1px solid #37474f;
+      padding: 7px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #eceff1;
+      box-sizing: border-box;
+    }
+    .vol-row input[type="range"] {
+      flex: 1;
+      accent-color: #00e5ff;
+      cursor: pointer;
+      height: 6px;
+    }
+    .vol-val {
+      min-width: 42px;
+      text-align: right;
+      color: #00e5ff;
+      font-family: monospace;
+    }
     .status {
       margin-bottom: 14px;
       font-size: 14px;
@@ -230,7 +258,7 @@
 </head>
 <body>
 
-  <div class="ver">v10.4 PWA 摺疊版</div>
+  <div class="ver">v10.1 PWA 摺疊版</div>
   
   <!-- 預設摺疊：狀態燈號 -->
   <details>
@@ -255,6 +283,13 @@
       </select>
       <button class="ctrl-btn mic-on" id="toggleMicBtn">停止麥克風</button>
       <button class="ctrl-btn stt-on" id="toggleSttBtn">字幕: 開啟</button>
+      
+      <!-- 新增：接收音量控制 Bar -->
+      <div class="vol-row">
+        <span>🔊 音量</span>
+        <input type="range" id="volSlider" min="0" max="200" value="100" step="5">
+        <span class="vol-val" id="volValue">100%</span>
+      </div>
     </div>
   </details>
 
@@ -262,7 +297,7 @@
   <button id="initBtn">啟用全天候對講機</button>
   <button id="pttBtn">按住通話 (PTT)</button>
 
-  <!-- 廣東話即時字幕紀錄區 -->
+  <!-- 廣東話即時對話字幕框 -->
   <div class="chat-box" id="chatBox">
     <div class="chat-msg" style="color:#607d8b; text-align:center; font-size:12px;">
       --- 廣東話即時對話字幕 (按住 PTT 講話自動辨識) ---
@@ -280,13 +315,10 @@
     const MY_ID = Math.floor(Math.random() * 0xFFFFFFFF) >>> 0;
     const MY_ID_HEX = MY_ID.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
 
-    // 偵測係咪舊款 iOS (iOS 15 或以下)，或者一般 iOS
-    const iosVerMatch = navigator.userAgent.match(/OS (\d+)_/);
-    const IOS_VER = iosVerMatch ? parseInt(iosVerMatch[1], 10) : 0;
-    const IS_OLD_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) && IOS_VER > 0 && IOS_VER <= 15;
-
     let client = null;
     let audioCtx = null;
+    let rxGainNode = null;
+    let rxVolume = 1.0;
     let micStream = null;
     let micEnabled = false;
     let scriptNode = null;
@@ -302,11 +334,8 @@
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     let recognition = null;
-    // 舊 iPhone (iOS <= 15) 預設關閉本機發話時嘅 SpeechRecognition 免得搶走個咪令對方聽唔到聲，但照樣睇到對面字幕！
-    // 新 iPhone / Android / PC 預設開啟字幕，一撳 PTT 即時邊講邊出字！
-    let sttEnabled = !IS_OLD_IOS;
+    let sttEnabled = true;
     let currentTranscript = "";
-    let finalizedTranscript = "";
 
     const initBtn = document.getElementById('initBtn');
     const pttBtn = document.getElementById('pttBtn');
@@ -320,7 +349,19 @@
     const channelSelect = document.getElementById('channelSelect');
     const toggleMicBtn = document.getElementById('toggleMicBtn');
     const toggleSttBtn = document.getElementById('toggleSttBtn');
+    const volSlider = document.getElementById('volSlider');
+    const volValue = document.getElementById('volValue');
     const chatBox = document.getElementById('chatBox');
+
+    // 音量控制拉尺事件
+    volSlider.oninput = () => {
+      const pct = parseInt(volSlider.value, 10);
+      volValue.innerText = pct + "%";
+      rxVolume = pct / 100.0;
+      if (rxGainNode && audioCtx) {
+        rxGainNode.gain.setValueAtTime(rxVolume, audioCtx.currentTime);
+      }
+    };
 
     const ULAW_DECODE = new Float32Array(256);
     (function initUlawTable() {
@@ -353,20 +394,6 @@
     }
     updateDebug();
 
-    function syncSttButtonUI() {
-      if (sttEnabled) {
-        toggleSttBtn.innerText = "字幕: 開啟";
-        toggleSttBtn.className = "ctrl-btn stt-on";
-        sttBadge.innerText = "粵語字幕: 就緒";
-        sttBadge.className = "badge ok";
-      } else {
-        toggleSttBtn.innerText = "字幕: 關閉 (保音質)";
-        toggleSttBtn.className = "ctrl-btn";
-        sttBadge.innerText = "粵語字幕: 純看字 (防搶咪)";
-        sttBadge.className = "badge warn";
-      }
-    }
-
     function initSpeechRecognition() {
       if (!SpeechRecognition) {
         sttBadge.innerText = "粵語字幕: 瀏覽器不支援";
@@ -377,9 +404,7 @@
 
       recognition = new SpeechRecognition();
       recognition.lang = 'zh-HK';
-      // 重要修復：iOS Safari 如果設 continuous = true 好容易卡死完全唔觸發 onresult
-      // 改用 false 並喺 isTalking 期間自動接續，iPhone 同 Android 都秒出字幕！
-      recognition.continuous = false;
+      recognition.continuous = true;
       recognition.interimResults = true;
 
       recognition.onstart = () => {
@@ -390,7 +415,7 @@
       recognition.onresult = (event) => {
         let interim = "";
         let finalStr = "";
-        for (let i = event.resultIndex; i < event.results.length; i++) {
+        for (let i = 0; i < event.results.length; i++) {
           const transcript = event.results[i][0].transcript;
           if (event.results[i].isFinal) {
             finalStr += transcript;
@@ -398,10 +423,7 @@
             interim += transcript;
           }
         }
-        if (finalStr) {
-          finalizedTranscript += finalStr;
-        }
-        currentTranscript = (finalizedTranscript + interim).trim();
+        currentTranscript = (finalStr + interim).trim();
         if (currentTranscript) {
           upsertChatMessage(MY_ID_HEX, currentTranscript, false, true);
           publishTextSubtitle(currentTranscript, false);
@@ -416,15 +438,14 @@
       };
 
       recognition.onend = () => {
-        // 如果仲撳緊 PTT 講緊嘢，自動繼續聽寫下一句
-        if (isTalking && sttEnabled) {
-          try { recognition.start(); } catch (e) {}
-        } else {
-          syncSttButtonUI();
+        if (sttEnabled) {
+          sttBadge.innerText = "粵語字幕: 就緒";
+          sttBadge.className = "badge ok";
         }
       };
 
-      syncSttButtonUI();
+      sttBadge.innerText = "粵語字幕: 就緒";
+      sttBadge.className = "badge ok";
     }
 
     function publishTextSubtitle(text, isFinal) {
@@ -463,10 +484,18 @@
 
     toggleSttBtn.onclick = () => {
       sttEnabled = !sttEnabled;
-      if (!sttEnabled && recognition) {
-        try { recognition.stop(); } catch (e) {}
+      if (sttEnabled) {
+        toggleSttBtn.innerText = "字幕: 開啟";
+        toggleSttBtn.className = "ctrl-btn stt-on";
+        sttBadge.innerText = "粵語字幕: 就緒";
+        sttBadge.className = "badge ok";
+      } else {
+        if (recognition) { try { recognition.stop(); } catch (e) {} }
+        toggleSttBtn.innerText = "字幕: 關閉";
+        toggleSttBtn.className = "ctrl-btn";
+        sttBadge.innerText = "粵語字幕: 已關閉";
+        sttBadge.className = "badge off";
       }
-      syncSttButtonUI();
     };
 
     function playRogerBeep(freq = 1250, durationMs = 65) {
@@ -476,7 +505,7 @@
         const gain = audioCtx.createGain();
         osc.type = 'sine';
         osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
-        gain.gain.setValueAtTime(0.08, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.08 * rxVolume, audioCtx.currentTime);
         gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + durationMs / 1000);
         osc.connect(gain);
         gain.connect(audioCtx.destination);
@@ -612,6 +641,10 @@
       initSpeechRecognition();
 
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      rxGainNode = audioCtx.createGain();
+      rxGainNode.gain.value = rxVolume;
+      rxGainNode.connect(audioCtx.destination);
+
       await ensureAudioActive();
       startAudioKeepAlive();
       await requestWakeLock();
@@ -631,7 +664,7 @@
         netBadge.className = "badge ok";
         pttBtn.classList.remove('offline');
         initBtn.style.display = 'none';
-        controlsDetails.style.display = 'block';
+        controlsDetails.style.display = 'block'; // 連線後顯示頻道與設定選單
         pttBtn.style.display = 'block';
         chatBox.style.display = 'block';
         client.subscribe(currentTopic, { qos: 0 });
@@ -722,7 +755,7 @@
 
       const source = audioCtx.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(audioCtx.destination);
+      source.connect(rxGainNode || audioCtx.destination);
 
       const now = audioCtx.currentTime;
       if (nextStartTime < now || (nextStartTime - now) > 0.16) {
@@ -779,7 +812,6 @@
 
       isTalking = true;
       currentTranscript = "";
-      finalizedTranscript = "";
       pttBtn.classList.remove('receiving');
       pttBtn.classList.add('active');
       pttBtn.innerText = "正在廣播中...";
@@ -788,39 +820,19 @@
       ensureAudioActive();
       playRogerBeep(1500, 45);
 
+      if (sttEnabled && recognition) {
+        try { recognition.start(); } catch (e) {}
+      }
+
       const source = audioCtx.createMediaStreamSource(micStream);
       scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
 
       silencer = audioCtx.createGain();
       silencer.gain.value = 0;
 
-      // 檢測係咪被 iOS SpeechRecognition 搶咗咪（連續收到全 0 靜音 frame）
-      let silentFrames = 0;
-
       scriptNode.onaudioprocess = (e) => {
         if (!isTalking || !client.connected) return;
         const inputData = e.inputBuffer.getChannelData(0);
-
-        // 自動防搶咪保護：如果開住字幕時，發現 iOS 將 micStream 變咗全 0 靜音
-        // 立即自動 stop 咗個 SpeechRecognition 搶返個咪，確保對面電話即刻聽返聲！
-        if (sttEnabled && recognition) {
-          let maxVal = 0;
-          for (let i = 0; i < inputData.length; i += 16) {
-            const v = Math.abs(inputData[i]);
-            if (v > maxVal) maxVal = v;
-          }
-          if (maxVal === 0) {
-            silentFrames++;
-            if (silentFrames >= 4) {
-              sttEnabled = false;
-              try { recognition.abort(); } catch (err) {}
-              syncSttButtonUI();
-            }
-          } else {
-            silentFrames = 0;
-          }
-        }
-
         const packet = encodeAudioPacket(inputData, audioCtx.sampleRate);
         client.publish(currentTopic, packet, { qos: 0 });
 
@@ -831,10 +843,6 @@
       source.connect(scriptNode);
       scriptNode.connect(silencer);
       silencer.connect(audioCtx.destination);
-
-      if (sttEnabled && recognition) {
-        try { recognition.start(); } catch (e) {}
-      }
     }
 
     function stopTalking() {
@@ -860,7 +868,6 @@
         upsertChatMessage(MY_ID_HEX, currentTranscript, true, true);
         publishTextSubtitle(currentTranscript, true);
         currentTranscript = "";
-        finalizedTranscript = "";
       }
 
       playRogerBeep(1050, 60);
