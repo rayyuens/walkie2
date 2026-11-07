@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.4 iPhone 原生字幕修復版</title>
+  <title>Web 對講機 - v10.5 原生字幕修復版</title>
   
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
   <meta name="theme-color" content="#0b0d10">
@@ -274,7 +274,7 @@
   </style>
 </head>
 <body>
-  <div class="ver">v10.4 iPhone 原生字幕修復版</div>
+  <div class="ver">v10.5 原生字幕修復版</div>
   
   <details>
     <summary>📊 系統狀態燈號</summary>
@@ -322,7 +322,7 @@
 
   <div class="chat-box" id="chatBox">
     <div class="chat-msg" style="color:#607d8b; text-align:center; font-size:12px;">
-      --- 廣東話即時字幕 (iOS 免搶咪原生支援) ---
+      --- 廣東話即時字幕 (按住通話自動顯示) ---
     </div>
   </div>
 
@@ -333,7 +333,7 @@
     let baseTopic = "ray_walkie_hk/ch1";
     let topicSecretSuffix = "";
     let currentTopic = baseTopic;
-    let currentTextTopic = currentTopic + "/text";
+    let currentTextTopic = baseTopic + "/text";
     const TARGET_RATE = 16000;
     const MY_ID = Math.floor(Math.random() * 0xFFFFFFFF) >>> 0;
     const MY_ID_HEX = MY_ID.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
@@ -361,12 +361,12 @@
     let currentMagic = DEFAULT_MAGIC;
     let cipherMask = null;
 
-    // 原生語音辨識相關
+    // 原生語音辨識
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     let recognition = null;
     let sttEnabled = true;
     let currentTranscript = "";
-    let isRecognitionActive = false;
+    let recognitionRunning = false;
 
     const initBtn = document.getElementById('initBtn');
     const pttBtn = document.getElementById('pttBtn');
@@ -493,11 +493,11 @@
     updateDebug();
 
     // ====================================================
-    // 原生廣東話語音辨識（iOS 專用安全防搶咪機制）
+    // 原生廣東話語音辨識（即時且安全防卡死）
     // ====================================================
     function initSpeechRecognition() {
       if (!SpeechRecognition) {
-        sttBadge.innerText = "粵語字幕: 不支援";
+        sttBadge.innerText = "粵語字幕: 瀏覽器不支援";
         sttBadge.className = "badge off";
         toggleSttBtn.style.display = 'none';
         return;
@@ -505,13 +505,12 @@
 
       recognition = new SpeechRecognition();
       recognition.lang = 'zh-HK';
-      // 關鍵設定：continuous 設為 false，避免 iOS Safari 喺背景一直咬住麥克風唔放
-      recognition.continuous = false;
+      recognition.continuous = true;
       recognition.interimResults = true;
 
       recognition.onstart = () => {
-        isRecognitionActive = true;
-        sttBadge.innerText = "粵語字幕: 聆聽中...";
+        recognitionRunning = true;
+        sttBadge.innerText = "粵語字幕: 聽寫中...";
         sttBadge.className = "badge ok";
       };
 
@@ -534,14 +533,18 @@
       };
 
       recognition.onerror = (e) => {
-        isRecognitionActive = false;
-        if (e.error !== 'no-speech' && e.error !== 'aborted') {
-          console.warn("STT warning:", e.error);
+        console.warn("STT Error:", e.error);
+        if (e.error === 'not-allowed') {
+          sttBadge.innerText = "粵語字幕: 未授權辨識";
+          sttBadge.className = "badge off";
+        } else if (e.error !== 'no-speech' && e.error !== 'aborted') {
+          sttBadge.innerText = "粵語字幕: " + e.error;
+          sttBadge.className = "badge warn";
         }
       };
 
       recognition.onend = () => {
-        isRecognitionActive = false;
+        recognitionRunning = false;
         if (currentTranscript) {
           upsertChatMessage(MY_ID_HEX, currentTranscript, true, true);
           publishTextSubtitle(currentTranscript, true);
@@ -596,8 +599,8 @@
         sttBadge.innerText = "粵語字幕: 就緒";
         sttBadge.className = "badge ok";
       } else {
-        if (isRecognitionActive && recognition) {
-          try { recognition.abort(); } catch (e) {}
+        if (recognition && recognitionRunning) {
+          try { recognition.stop(); } catch (e) {}
         }
         toggleSttBtn.innerText = "字幕: 關閉";
         toggleSttBtn.className = "ctrl-btn";
@@ -788,7 +791,7 @@
 
     initBtn.onclick = async () => {
       initBtn.disabled = true;
-      statusText.innerText = "正在啟動音訊引擎...";
+      statusText.innerText = "正在啟動音訊引擎與語音辨識...";
 
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       rxGainNode = audioCtx.createGain();
@@ -842,17 +845,18 @@
         if (isTalking) stopTalking();
       });
 
-      // 100% 同步接收處理，保證音質最高
+      // 接收端：文字與語音分流
       client.on('message', (topic, payload) => {
         if (topic === currentTextTopic) {
           try {
             const data = JSON.parse(new TextDecoder().decode(payload));
-            if (data.magic === currentMagic && data.sender && data.sender !== MY_ID_HEX && data.text) {
+            if (data.sender && data.sender !== MY_ID_HEX && data.text) {
               upsertChatMessage(data.sender, data.text, data.final, false);
             }
           } catch (e) {}
           return;
         }
+
         if (topic !== currentTopic || isTalking || payload.byteLength <= 8) return;
         const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
         const packetMagic = view.getUint32(0, true);
@@ -862,7 +866,6 @@
         rxCount++;
         updateDebug();
 
-        // 避免回音抑制 (AEC Ducking)
         if (micStream && !isTalking) {
           const tracks = micStream.getAudioTracks();
           for (let i = 0; i < tracks.length; i++) {
@@ -872,7 +875,7 @@
 
         pttBtn.classList.add('receiving');
         pttBtn.innerText = "對方講話中...";
-        statusText.innerText = `正在接收來自 [${senderId.toString(16).toUpperCase().padStart(8, '0').slice(0, 4)}] 的語音...`;
+        statusText.innerText = `正在接收語音 [${senderId.toString(16).toUpperCase().padStart(8, '0').slice(0, 4)}]...`;
         clearTimeout(rxTimeout);
         rxTimeout = setTimeout(() => {
           if (!isTalking) {
@@ -999,12 +1002,6 @@
       }
       if (!client || !client.connected || isTalking) return;
 
-      // 【關鍵修復 1】：如果語音辨識仲行緊，即刻 abort 佢，將麥克風 100% 讓俾 WebAudio 發話
-      if (recognition && isRecognitionActive) {
-        try { recognition.abort(); } catch (e) {}
-        isRecognitionActive = false;
-      }
-
       const tracks = micStream.getAudioTracks();
       if (tracks.length === 0 || tracks[0].readyState === 'ended') {
         await enableMicrophone();
@@ -1018,12 +1015,22 @@
       pttBtn.classList.remove('receiving');
       pttBtn.classList.add('active');
       pttBtn.innerText = "正在廣播中...";
-      statusText.innerText = "正在發送語音（放開後自動出字幕）...";
+      statusText.innerText = "正在發送語音及即時字幕...";
 
       await ensureAudioActive();
       if (!isTalking) return;
 
       playRogerBeep(1500, 45);
+
+      // 【核心修復】：在用戶 Touch / MouseDown 當下直接 start recognition
+      // 滿足 Safari User Gesture 需求，避免被 iOS 攔截阻擋
+      if (sttEnabled && recognition && !recognitionRunning) {
+        try {
+          recognition.start();
+        } catch (e) {
+          console.warn("Recognition start skipped:", e);
+        }
+      }
 
       if (!micSourceNode) {
         micSourceNode = audioCtx.createMediaStreamSource(micStream);
@@ -1053,7 +1060,6 @@
       pttBtn.innerText = micEnabled ? "按住通話 (PTT)" : "純收聽模式\n(已關閉麥克風)";
       statusText.innerText = "通話結束，放開收聽中";
 
-      // 【關鍵修復 2】：發話結束，即刻斷開 WebAudio 的 ScriptProcessor，釋放音訊節點
       if (micSourceNode && scriptNode) {
         try { micSourceNode.disconnect(scriptNode); } catch (e) {}
       }
@@ -1069,18 +1075,11 @@
 
       playRogerBeep(1050, 60);
 
-      // 【關鍵修復 3】：等 WebAudio 節點斷開 50ms 後，先啟動原生辨識
-      // 呢個微延遲保證 iOS AudioSession 順利交接，舊 iPhone 100% 唔會再因搶咪而發全 0 靜音！
-      if (sttEnabled && recognition) {
-        setTimeout(() => {
-          if (!isTalking && !isRecognitionActive) {
-            try {
-              recognition.start();
-            } catch (e) {
-              console.warn("Recognition start handover ignored:", e);
-            }
-          }
-        }, 50);
+      // 發話結束時停止語音辨識，觸發 onresult 產生 final 字句
+      if (recognition && recognitionRunning) {
+        try {
+          recognition.stop();
+        } catch (e) {}
       }
     }
   </script>
