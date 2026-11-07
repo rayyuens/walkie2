@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.1 PWA 摺疊加密版</title>
+  <title>Web 對講機 - v10.1 PWA 摺疊防干擾版</title>
   
   <!-- PWA Manifest 內嵌支援 -->
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
@@ -273,7 +273,7 @@
 </head>
 <body>
 
-  <div class="ver">v10.1 PWA 摺疊版 (帶加密及音量控制)</div>
+  <div class="ver">v10.1 PWA 摺疊版 (雙重防干擾靜音鎖)</div>
   
   <!-- 預設摺疊：狀態燈號 -->
   <details>
@@ -300,13 +300,13 @@
       <button class="ctrl-btn mic-on" id="toggleMicBtn">停止麥克風</button>
       <button class="ctrl-btn stt-on" id="toggleSttBtn">字幕: 開啟</button>
 
-      <!-- 新增：頻道加密密碼輸入框 -->
+      <!-- 頻道加密密碼輸入框 -->
       <div class="pwd-row">
         <span>🔑 密碼</span>
-        <input type="password" id="channelPasswordInput" class="pwd-input" placeholder="輸入相同密碼即可加密通話 (留空為公開)">
+        <input type="password" id="channelPasswordInput" class="pwd-input" placeholder="輸入私人密碼防干擾 (留空為公開)">
       </div>
 
-      <!-- 新增：接收音量控制 Bar -->
+      <!-- 接收音量控制 Bar -->
       <div class="vol-row">
         <span>🔊 音量</span>
         <input type="range" id="volSlider" min="0" max="200" value="100" step="5">
@@ -330,9 +330,14 @@
 
   <script>
     const MQTT_BROKER = "wss://broker.hivemq.com:8884/mqtt";
-    let currentTopic = "ray_walkie_hk/ch1";
+    let baseTopic = "ray_walkie_hk/ch1";
+    let topicSecretSuffix = "/public";
+    let currentTopic = baseTopic + topicSecretSuffix;
     let currentTextTopic = currentTopic + "/text";
     const TARGET_RATE = 16000;
+
+    // 封包專屬驗證標頭 "RWK1" (0x52574B31)，確保唔同密碼或外人封包 100% 唔會當成聲音播出來
+    const PACKET_MAGIC = 0x52574B31;
 
     const MY_ID = Math.floor(Math.random() * 0xFFFFFFFF) >>> 0;
     const MY_ID_HEX = MY_ID.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
@@ -380,18 +385,45 @@
     const volValue = document.getElementById('volValue');
     const chatBox = document.getElementById('chatBox');
 
-    // ==========================================
-    // 端對端 AES-GCM 加密與解密函數
-    // ==========================================
+    // ====================================================
+    // 雙重防干擾加密：1. 隱藏私人 Topic 路徑 + 2. AES-GCM 封包加密
+    // ====================================================
+    function refreshSubscriptionTopics() {
+      const newTopic = baseTopic + topicSecretSuffix;
+      const newTextTopic = newTopic + "/text";
+      if (client && client.connected) {
+        if (currentTopic !== newTopic) {
+          client.unsubscribe(currentTopic);
+          client.unsubscribe(currentTextTopic);
+          currentTopic = newTopic;
+          currentTextTopic = newTextTopic;
+          client.subscribe(currentTopic, { qos: 0 });
+          client.subscribe(currentTextTopic, { qos: 0 });
+        }
+      } else {
+        currentTopic = newTopic;
+        currentTextTopic = newTextTopic;
+      }
+    }
+
     async function setChannelPassword(password) {
       if (!password) {
         cryptoKey = null;
+        topicSecretSuffix = "/public";
+        refreshSubscriptionTopics();
         secBadge.innerText = "加密: 公開模式";
         secBadge.className = "badge warn";
         return;
       }
       try {
         const enc = new TextEncoder();
+        // 1. 產生隱藏版私人頻道 Hash，外人連 Topic 名都撞唔中
+        const hashBuf = await crypto.subtle.digest("SHA-256", enc.encode("walkie_room_" + password));
+        const hashHex = Array.from(new Uint8Array(hashBuf)).slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');
+        topicSecretSuffix = "/sec_" + hashHex;
+        refreshSubscriptionTopics();
+
+        // 2. 產生 AES-GCM 128-bit 金鑰
         const keyMaterial = await crypto.subtle.importKey(
           "raw",
           enc.encode(password),
@@ -411,7 +443,7 @@
           false,
           ["encrypt", "decrypt"]
         );
-        secBadge.innerText = "加密: AES已鎖定";
+        secBadge.innerText = "加密: 私人防干擾鎖定";
         secBadge.className = "badge ok";
       } catch (err) {
         cryptoKey = null;
@@ -420,36 +452,59 @@
       }
     }
 
+    // 封包格式：
+    // 公開模式：[0x00 (1 byte)] + [原始資料]
+    // 加密模式：[0x01 (1 byte)] + [12 bytes IV] + [AES-GCM 密文]
     async function encryptPayload(uint8Data) {
-      if (!cryptoKey) return uint8Data;
+      if (!cryptoKey) {
+        const out = new Uint8Array(1 + uint8Data.byteLength);
+        out[0] = 0x00; // 標記為無密碼公開封包
+        out.set(uint8Data, 1);
+        return out;
+      }
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const encrypted = await crypto.subtle.encrypt(
         { name: "AES-GCM", iv: iv },
         cryptoKey,
         uint8Data
       );
-      const combined = new Uint8Array(iv.length + encrypted.byteLength);
-      combined.set(iv, 0);
-      combined.set(new Uint8Array(encrypted), iv.length);
+      const combined = new Uint8Array(1 + iv.length + encrypted.byteLength);
+      combined[0] = 0x01; // 標記為 AES 加密封包
+      combined.set(iv, 1);
+      combined.set(new Uint8Array(encrypted), 1 + iv.length);
       return combined;
     }
 
     async function decryptPayload(uint8Data) {
-      if (!cryptoKey) return uint8Data;
-      if (uint8Data.length <= 12) return null;
-      const iv = uint8Data.slice(0, 12);
-      const data = uint8Data.slice(12);
-      try {
-        const decrypted = await crypto.subtle.decrypt(
-          { name: "AES-GCM", iv: iv },
-          cryptoKey,
-          data
-        );
-        return new Uint8Array(decrypted);
-      } catch (e) {
-        // 密碼不符或未加密之封包，直接丟棄
-        return null;
+      if (!uint8Data || uint8Data.byteLength < 2) return null;
+      const mode = uint8Data[0];
+
+      // 如果本機有設密碼，但收到未加密封包 -> 100% 攔截靜音
+      if (cryptoKey && mode !== 0x01) return null;
+      // 如果本機無設密碼，但收到加密封包 -> 100% 攔截靜音（防止將密文當聲音播造成沙沙聲！）
+      if (!cryptoKey && mode !== 0x00) return null;
+
+      if (mode === 0x00) {
+        return uint8Data.slice(1);
       }
+
+      if (mode === 0x01) {
+        if (uint8Data.byteLength <= 13) return null;
+        const iv = uint8Data.slice(1, 13);
+        const data = uint8Data.slice(13);
+        try {
+          const decrypted = await crypto.subtle.decrypt(
+            { name: "AES-GCM", iv: iv },
+            cryptoKey,
+            data
+          );
+          return new Uint8Array(decrypted);
+        } catch (e) {
+          // 密碼錯誤：AES-GCM 驗證失敗，直接 return null 保持絕對靜音！
+          return null;
+        }
+      }
+      return null;
     }
 
     // 載入本機已儲存嘅密碼
@@ -463,7 +518,7 @@
       const pwd = channelPasswordInput.value.trim();
       localStorage.setItem('walkie_channel_pwd', pwd);
       await setChannelPassword(pwd);
-      statusText.innerText = pwd ? "🔒 已啟用密碼加密！雙方密碼相同方可收聽及看字幕" : "🔓 目前為公開頻道（未設密碼）";
+      statusText.innerText = pwd ? "🔒 已切換至私人加密頻道！錯密碼或外人 100% 零雜音" : "🔓 目前為公開頻道（未設密碼）";
     });
 
     // 音量控制拉尺事件
@@ -680,17 +735,10 @@
     };
 
     channelSelect.onchange = () => {
-      const newTopic = channelSelect.value;
-      if (client && client.connected && newTopic !== currentTopic) {
-        client.unsubscribe(currentTopic);
-        client.unsubscribe(currentTextTopic);
-        currentTopic = newTopic;
-        currentTextTopic = currentTopic + "/text";
-        client.subscribe(currentTopic, { qos: 0 });
-        client.subscribe(currentTextTopic, { qos: 0 });
-        playRogerBeep(1500, 50);
-        statusText.innerText = `已切換至 ${channelSelect.options[channelSelect.selectedIndex].text}`;
-      }
+      baseTopic = channelSelect.value;
+      refreshSubscriptionTopics();
+      playRogerBeep(1500, 50);
+      statusText.innerText = `已切換至 ${channelSelect.options[channelSelect.selectedIndex].text}`;
     };
 
     async function requestWakeLock() {
@@ -780,7 +828,7 @@
         netBadge.className = "badge ok";
         pttBtn.classList.remove('offline');
         initBtn.style.display = 'none';
-        controlsDetails.style.display = 'block'; // 連線後顯示頻道與設定選單
+        controlsDetails.style.display = 'block';
         pttBtn.style.display = 'block';
         chatBox.style.display = 'block';
         client.subscribe(currentTopic, { qos: 0 });
@@ -804,7 +852,8 @@
       client.on('message', async (topic, payload) => {
         const rawIncoming = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
         const decrypted = await decryptPayload(rawIncoming);
-        if (!decrypted) return; // 密碼唔啱，直接無視該訊息或語音
+        // 如果密碼唔同、或者一邊有設密碼一邊無設密碼，decrypted 會係 null，100% 靜音丟棄！
+        if (!decrypted) return;
 
         if (topic === currentTextTopic) {
           try {
@@ -816,10 +865,14 @@
           return;
         }
 
-        if (topic !== currentTopic || isTalking || decrypted.byteLength <= 4) return;
+        if (topic !== currentTopic || isTalking || decrypted.byteLength <= 8) return;
 
         const view = new DataView(decrypted.buffer, decrypted.byteOffset, decrypted.byteLength);
-        const senderId = view.getUint32(0, true);
+        // 檢查封包專屬簽名 "RWK1"，唔啱簽名嘅雜訊封包一律靜音丟棄
+        const magic = view.getUint32(0, false);
+        if (magic !== PACKET_MAGIC) return;
+
+        const senderId = view.getUint32(4, true);
         if (senderId === MY_ID) return;
 
         rxCount++;
@@ -838,7 +891,7 @@
           }
         }, 350);
 
-        playIncomingUlaw(new Uint8Array(decrypted.buffer, decrypted.byteOffset + 4, decrypted.byteLength - 4));
+        playIncomingUlaw(new Uint8Array(decrypted.buffer, decrypted.byteOffset + 8, decrypted.byteLength - 8));
       });
     };
 
@@ -889,9 +942,11 @@
     function encodeAudioPacket(float32Buffer, inputRate) {
       const ratio = inputRate / TARGET_RATE;
       const sampleCount = Math.floor(float32Buffer.length / ratio);
-      const packet = new Uint8Array(4 + sampleCount);
+      // 8 bytes Header: [4 bytes PACKET_MAGIC] + [4 bytes MY_ID]
+      const packet = new Uint8Array(8 + sampleCount);
       const view = new DataView(packet.buffer);
-      view.setUint32(0, MY_ID, true);
+      view.setUint32(0, PACKET_MAGIC, false);
+      view.setUint32(4, MY_ID, true);
 
       for (let i = 0; i < sampleCount; i++) {
         const start = Math.floor(i * ratio);
@@ -912,7 +967,7 @@
 
         let clamped = Math.max(-1, Math.min(1, avg));
         let int16 = clamped < 0 ? (clamped * 32768) : (clamped * 32767);
-        packet[4 + i] = linearToUlaw(int16 | 0);
+        packet[8 + i] = linearToUlaw(int16 | 0);
       }
       return packet;
     }
