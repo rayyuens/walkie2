@@ -3,9 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.2 PWA 電腦及手機修復版</title>
+  <title>Web 對講機 - v10.4 iPhone 原生字幕修復版</title>
   
-  <!-- PWA Manifest 內嵌支援 -->
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
   <meta name="theme-color" content="#0b0d10">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -37,7 +36,6 @@
       margin-bottom: 8px;
       font-weight: 600;
     }
-    /* 摺疊面板樣式 */
     details {
       width: 90%;
       max-width: 400px;
@@ -129,7 +127,6 @@
       color: #84ffff;
       background: rgba(0, 229, 255, 0.1);
     }
-    /* 密碼輸入框與音量控制拉尺樣式 */
     .pwd-row, .vol-row {
       width: 100%;
       display: flex;
@@ -228,7 +225,6 @@
       background: #546e7a;
       box-shadow: none;
     }
-    /* 廣東話即時對話字幕框 */
     .chat-box {
       display: none;
       width: 90%;
@@ -278,9 +274,8 @@
   </style>
 </head>
 <body>
-  <div class="ver">v10.2 PWA 電腦及手機修復版</div>
+  <div class="ver">v10.4 iPhone 原生字幕修復版</div>
   
-  <!-- 預設摺疊：狀態燈號 -->
   <details>
     <summary>📊 系統狀態燈號</summary>
     <div class="badges">
@@ -291,7 +286,7 @@
       <div class="badge warn" id="secBadge">密碼鎖: 公開模式</div>
     </div>
   </details>
-  <!-- 預設摺疊：頻道與音訊選項（連線後才顯示） -->
+
   <details id="controlsDetails" style="display:none;">
     <summary>⚙️ 頻道與設定選單</summary>
     <div class="controls-bar" id="controlsBar" style="display:flex;">
@@ -303,16 +298,16 @@
       </select>
       <button class="ctrl-btn mic-on" id="toggleMicBtn">停止麥克風</button>
       <button class="ctrl-btn stt-on" id="toggleSttBtn">字幕: 開啟</button>
-      <!-- 新增：電腦多麥克風切換選單 -->
+      
       <select id="micSelect" title="選擇麥克風裝置">
         <option value="">🎙️ 預設麥克風</option>
       </select>
-      <!-- 零延遲同步密碼鎖輸入框 -->
+
       <div class="pwd-row">
         <span>🔑 密碼</span>
         <input type="password" id="channelPasswordInput" class="pwd-input" placeholder="輸入私人密碼防干擾 (留空為公開)">
       </div>
-      <!-- 接收音量控制 Bar -->
+
       <div class="vol-row">
         <span>🔊 音量</span>
         <input type="range" id="volSlider" min="0" max="200" value="100" step="5">
@@ -320,16 +315,19 @@
       </div>
     </div>
   </details>
-  <div class="status" id="statusText">請點擊下方按鈕啟動音訊與廣東話字幕</div>
+
+  <div class="status" id="statusText">請點擊下方按鈕啟動對講機</div>
   <button id="initBtn">啟用全天候對講機</button>
   <button id="pttBtn">按住通話 (PTT)</button>
-  <!-- 廣東話即時字幕紀錄區 -->
+
   <div class="chat-box" id="chatBox">
     <div class="chat-msg" style="color:#607d8b; text-align:center; font-size:12px;">
-      --- 廣東話即時對話字幕 (按住 PTT 或 Spacebar 講話) ---
+      --- 廣東話即時字幕 (iOS 免搶咪原生支援) ---
     </div>
   </div>
+
   <div class="debug" id="debugText">本機 ID: ---- | TX: 0 | RX: 0</div>
+
   <script>
     const MQTT_BROKER = "wss://broker.hivemq.com:8884/mqtt";
     let baseTopic = "ray_walkie_hk/ch1";
@@ -340,16 +338,12 @@
     const MY_ID = Math.floor(Math.random() * 0xFFFFFFFF) >>> 0;
     const MY_ID_HEX = MY_ID.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
 
-    // 偵測是否為 iOS / iPhone / iPad（防止 iOS SpeechRecognition 搶走 WebAudio 麥克風導致發話無聲）
-    const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || 
-                   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-
     let client = null;
     let audioCtx = null;
     let rxGainNode = null;
     let rxVolume = 1.0;
     let micStream = null;
-    let micSourceNode = null; // 單一 Source Node 重用，避免電腦瀏覽器鎖死音訊流
+    let micSourceNode = null;
     let micEnabled = false;
     let selectedMicDeviceId = "";
     let scriptNode = null;
@@ -363,14 +357,16 @@
     let rxCount = 0;
     let rxTimeout = null;
 
-    // 零延遲同步密碼鎖變數（唔用 async WebCrypto，100% 唔會拖慢舊手機 CPU 或搞亂封包順序）
-    const DEFAULT_MAGIC = 0x52574B31; // 公開模式識別碼
+    const DEFAULT_MAGIC = 0x52574B31;
     let currentMagic = DEFAULT_MAGIC;
     let cipherMask = null;
+
+    // 原生語音辨識相關
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     let recognition = null;
-    let sttEnabled = !IS_IOS; // iOS 預設關閉本機語音辨識以確保錄音 100% 正常，但仍可接收對方字幕
+    let sttEnabled = true;
     let currentTranscript = "";
+    let isRecognitionActive = false;
 
     const initBtn = document.getElementById('initBtn');
     const pttBtn = document.getElementById('pttBtn');
@@ -391,9 +387,6 @@
     const volValue = document.getElementById('volValue');
     const chatBox = document.getElementById('chatBox');
 
-    // ====================================================
-    // 零延遲同步密碼計算（0ms 同步執行，完全不阻塞音訊流）
-    // ====================================================
     function fnv1a32(str) {
       let h = 0x811c9dc5;
       for (let i = 0; i < str.length; i++) {
@@ -402,6 +395,7 @@
       }
       return h >>> 0;
     }
+
     function refreshSubscriptionTopics() {
       const newTopic = baseTopic + topicSecretSuffix;
       const newTextTopic = newTopic + "/text";
@@ -419,6 +413,7 @@
         currentTextTopic = newTextTopic;
       }
     }
+
     function applyChannelPassword(pwd) {
       if (!pwd) {
         currentMagic = DEFAULT_MAGIC;
@@ -455,7 +450,7 @@
       const pwd = channelPasswordInput.value.trim();
       localStorage.setItem('walkie_channel_pwd', pwd);
       applyChannelPassword(pwd);
-      statusText.innerText = pwd ? "🔒 已鎖定私人密碼頻道（零延遲同步模式）" : "🔓 目前為公開頻道（未設密碼）";
+      statusText.innerText = pwd ? "🔒 已鎖定私人密碼頻道" : "🔓 目前為公開頻道";
     });
 
     volSlider.oninput = () => {
@@ -497,29 +492,29 @@
     }
     updateDebug();
 
+    // ====================================================
+    // 原生廣東話語音辨識（iOS 專用安全防搶咪機制）
+    // ====================================================
     function initSpeechRecognition() {
-      if (IS_IOS) {
-        sttEnabled = false;
-        sttBadge.innerText = "粵語字幕: 僅接收(防搶咪)";
-        sttBadge.className = "badge warn";
-        toggleSttBtn.innerText = "字幕發送: iOS保護關閉";
-        toggleSttBtn.className = "ctrl-btn";
-        return;
-      }
       if (!SpeechRecognition) {
-        sttBadge.innerText = "粵語字幕: 瀏覽器不支援";
+        sttBadge.innerText = "粵語字幕: 不支援";
         sttBadge.className = "badge off";
         toggleSttBtn.style.display = 'none';
         return;
       }
+
       recognition = new SpeechRecognition();
       recognition.lang = 'zh-HK';
-      recognition.continuous = true;
+      // 關鍵設定：continuous 設為 false，避免 iOS Safari 喺背景一直咬住麥克風唔放
+      recognition.continuous = false;
       recognition.interimResults = true;
+
       recognition.onstart = () => {
-        sttBadge.innerText = "粵語字幕: 聽寫中...";
+        isRecognitionActive = true;
+        sttBadge.innerText = "粵語字幕: 聆聽中...";
         sttBadge.className = "badge ok";
       };
+
       recognition.onresult = (event) => {
         let interim = "";
         let finalStr = "";
@@ -537,18 +532,27 @@
           publishTextSubtitle(currentTranscript, false);
         }
       };
+
       recognition.onerror = (e) => {
+        isRecognitionActive = false;
         if (e.error !== 'no-speech' && e.error !== 'aborted') {
-          sttBadge.innerText = "粵語字幕: " + e.error;
-          sttBadge.className = "badge warn";
+          console.warn("STT warning:", e.error);
         }
       };
+
       recognition.onend = () => {
+        isRecognitionActive = false;
+        if (currentTranscript) {
+          upsertChatMessage(MY_ID_HEX, currentTranscript, true, true);
+          publishTextSubtitle(currentTranscript, true);
+          currentTranscript = "";
+        }
         if (sttEnabled) {
           sttBadge.innerText = "粵語字幕: 就緒";
           sttBadge.className = "badge ok";
         }
       };
+
       sttBadge.innerText = "粵語字幕: 就緒";
       sttBadge.className = "badge ok";
     }
@@ -585,10 +589,6 @@
     }
 
     toggleSttBtn.onclick = () => {
-      if (IS_IOS) {
-        statusText.innerText = "⚠️ iOS 系統開啟語音辨識會中斷麥克風發話，已強制鎖定保護音訊！";
-        return;
-      }
       sttEnabled = !sttEnabled;
       if (sttEnabled) {
         toggleSttBtn.innerText = "字幕: 開啟";
@@ -596,7 +596,9 @@
         sttBadge.innerText = "粵語字幕: 就緒";
         sttBadge.className = "badge ok";
       } else {
-        if (recognition) { try { recognition.stop(); } catch (e) {} }
+        if (isRecognitionActive && recognition) {
+          try { recognition.abort(); } catch (e) {}
+        }
         toggleSttBtn.innerText = "字幕: 關閉";
         toggleSttBtn.className = "ctrl-btn";
         sttBadge.innerText = "粵語字幕: 已關閉";
@@ -620,7 +622,6 @@
       } catch (e) {}
     }
 
-    // 列出電腦上所有可用嘅麥克風裝置
     async function refreshMicDeviceList() {
       if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
       try {
@@ -673,7 +674,6 @@
         try {
           micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
         } catch (constraintErr) {
-          // 如果指定裝置或進階參數喺個別電腦音效卡失敗，自動退回最基本請求
           micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         }
 
@@ -716,7 +716,7 @@
       toggleMicBtn.className = "ctrl-btn mic-off";
       pttBtn.classList.add('disabled-mic');
       pttBtn.innerText = "純收聽模式\n(已關閉麥克風)";
-      statusText.innerText = "已停止存取麥克風，目前為省電純收聽及看字幕模式";
+      statusText.innerText = "已停止存取麥克風，目前為純收聽模式";
     }
 
     toggleMicBtn.onclick = async () => {
@@ -788,9 +788,8 @@
 
     initBtn.onclick = async () => {
       initBtn.disabled = true;
-      statusText.innerText = "正在啟動音訊引擎與廣東話辨識...";
-      
-      // 先建立 AudioContext，確保 enableMicrophone 可以即時綁定 micSourceNode
+      statusText.innerText = "正在啟動音訊引擎...";
+
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       rxGainNode = audioCtx.createGain();
       rxGainNode.gain.value = rxVolume;
@@ -843,7 +842,7 @@
         if (isTalking) stopTalking();
       });
 
-      // 100% 同步接收處理（無 async/await，保證舊手機封包次序絕對唔亂、聲音唔變矇）
+      // 100% 同步接收處理，保證音質最高
       client.on('message', (topic, payload) => {
         if (topic === currentTextTopic) {
           try {
@@ -863,7 +862,7 @@
         rxCount++;
         updateDebug();
 
-        // 收聽期間暫時將本機麥克風 Track 靜音，防止觸發硬件回音消除 (AEC Ducking)
+        // 避免回音抑制 (AEC Ducking)
         if (micStream && !isTalking) {
           const tracks = micStream.getAudioTracks();
           for (let i = 0; i < tracks.length; i++) {
@@ -904,7 +903,6 @@
       });
     };
 
-    // 接收與發送音訊演算法原封不動保留，確保最佳音質
     function playIncomingUlaw(ulawBytes) {
       if (!audioCtx) return;
       if (audioCtx.state !== 'running') audioCtx.resume();
@@ -971,7 +969,6 @@
       return packet;
     }
 
-    // 支援手機 Touch、電腦滑鼠點擊（包埋滑鼠移出按鈕放開）、以及電腦 Spacebar 空白鍵按住講嘢
     pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startTalking(); });
     pttBtn.addEventListener('touchend', (e) => { e.preventDefault(); stopTalking(); });
     pttBtn.addEventListener('touchcancel', (e) => { e.preventDefault(); stopTalking(); });
@@ -1002,7 +999,12 @@
       }
       if (!client || !client.connected || isTalking) return;
 
-      // 檢查電腦麥克風 Track 係咪意外斷開 (ended)，如斷開即自動重連
+      // 【關鍵修復 1】：如果語音辨識仲行緊，即刻 abort 佢，將麥克風 100% 讓俾 WebAudio 發話
+      if (recognition && isRecognitionActive) {
+        try { recognition.abort(); } catch (e) {}
+        isRecognitionActive = false;
+      }
+
       const tracks = micStream.getAudioTracks();
       if (tracks.length === 0 || tracks[0].readyState === 'ended') {
         await enableMicrophone();
@@ -1016,22 +1018,18 @@
       pttBtn.classList.remove('receiving');
       pttBtn.classList.add('active');
       pttBtn.innerText = "正在廣播中...";
-      statusText.innerText = IS_IOS ? "正在發送語音..." : "正在發送語音及同步廣東話字幕...";
+      statusText.innerText = "正在發送語音（放開後自動出字幕）...";
 
       await ensureAudioActive();
-      if (!isTalking) return; // 防止極速放手時狀態錯亂
+      if (!isTalking) return;
 
       playRogerBeep(1500, 45);
-      if (sttEnabled && recognition && !IS_IOS) {
-        try { recognition.start(); } catch (e) {}
-      }
 
       if (!micSourceNode) {
         micSourceNode = audioCtx.createMediaStreamSource(micStream);
       }
       scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
       silencer = audioCtx.createGain();
-      // 關鍵修復：唔可以用 0，因為電腦 Chrome/Edge 偵測到 Gain = 0 會停止執行 onaudioprocess！
       silencer.gain.value = 0.0001;
 
       scriptNode.onaudioprocess = (e) => {
@@ -1055,6 +1053,7 @@
       pttBtn.innerText = micEnabled ? "按住通話 (PTT)" : "純收聽模式\n(已關閉麥克風)";
       statusText.innerText = "通話結束，放開收聽中";
 
+      // 【關鍵修復 2】：發話結束，即刻斷開 WebAudio 的 ScriptProcessor，釋放音訊節點
       if (micSourceNode && scriptNode) {
         try { micSourceNode.disconnect(scriptNode); } catch (e) {}
       }
@@ -1067,15 +1066,22 @@
         try { silencer.disconnect(); } catch (e) {}
         silencer = null;
       }
-      if (recognition && !IS_IOS) {
-        try { recognition.stop(); } catch (e) {}
-      }
-      if (currentTranscript) {
-        upsertChatMessage(MY_ID_HEX, currentTranscript, true, true);
-        publishTextSubtitle(currentTranscript, true);
-        currentTranscript = "";
-      }
+
       playRogerBeep(1050, 60);
+
+      // 【關鍵修復 3】：等 WebAudio 節點斷開 50ms 後，先啟動原生辨識
+      // 呢個微延遲保證 iOS AudioSession 順利交接，舊 iPhone 100% 唔會再因搶咪而發全 0 靜音！
+      if (sttEnabled && recognition) {
+        setTimeout(() => {
+          if (!isTalking && !isRecognitionActive) {
+            try {
+              recognition.start();
+            } catch (e) {
+              console.warn("Recognition start handover ignored:", e);
+            }
+          }
+        }, 50);
+      }
     }
   </script>
 </body>
