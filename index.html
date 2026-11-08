@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v11.1 精簡穩定終極版</title>
+  <title>Web 對講機 - v11.2 背景喚醒自癒版</title>
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
   <meta name="theme-color" content="#0b0d10">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -152,7 +152,7 @@
   </style>
 </head>
 <body>
-  <div class="ver">v11.1 精簡穩定終極版</div>
+  <div class="ver">v11.2 背景喚醒自癒版</div>
   
   <details>
     <summary>📊 系統狀態燈號</summary>
@@ -256,9 +256,11 @@
     let micStream = null, wakeLock = null;
     let rxVolume = 1.0, micEnabled = false, selectedMicDeviceId = "";
     let isTalking = false, hasSpokenInCurrentPtt = false, silentFrameCount = 0;
+    let audioProcessFiredCount = 0, nonZeroSignalCount = 0, isRebuildingMic = false;
+    let hiddenTimestamp = 0, micNeedsRefresh = false;
     let nextStartTime = 0, lastSample = 0;
     let txCount = 0, rxCount = 0, subTxCount = 0;
-    let rxTimeout = null, sttStopTimer = null, keepAliveTimer = null, heartbeatTimer = null;
+    let rxTimeout = null, sttStopTimer = null, pttWatchdogTimer = null, keepAliveTimer = null, heartbeatTimer = null;
 
     const peers = {};
     let lastAckSentTime = 0;
@@ -357,7 +359,7 @@
         });
       }
 
-      if (isTalking) {
+      if (isTalking && !isRebuildingMic) {
         if (hearingMeCount > 0) {
           $('statusText').innerText = `✅ 對方正清晰收到你把聲！(${hearingMeCount} 人收聽中)`;
         } else if (!hasSpokenInCurrentPtt && silentFrameCount > 8) {
@@ -440,7 +442,7 @@
     };
 
     // ====================================================
-    // 廣東話語音辨識 (對齊 Google Demo 單次模式 + 防連撳衝突)
+    // 廣東話語音辨識
     // ====================================================
     function initSpeechRecognition() {
       if (!SpeechRecognition) {
@@ -527,7 +529,6 @@
         msgEl.id = interimId;
         msgEl.className = `chat-msg ${isMe ? 'me' : 'other'} interim`;
         box.appendChild(msgEl);
-        // 防止歷史訊息無限增長拖慢瀏覽器
         while (box.children.length > MAX_CHAT_HISTORY) {
           box.removeChild(box.children[1]);
         }
@@ -572,7 +573,7 @@
     };
 
     // ====================================================
-    // 音訊管道與麥克風管理 (共用單一 ScriptProcessor 防 Leak)
+    // 音訊管道與「背景死咪自動重生」機制
     // ====================================================
     function playRogerBeep(freq = 1250, durationMs = 65) {
       if (!audioCtx || audioCtx.state !== 'running') return;
@@ -590,8 +591,14 @@
       } catch (e) {}
     }
 
-    function setupAudioProcessor() {
-      if (!audioCtx || scriptNode) return;
+    function setupAudioProcessor(forceRecreate = false) {
+      if (!audioCtx) return;
+      if (forceRecreate) {
+        if (scriptNode) { try { scriptNode.disconnect(); } catch (e) {} scriptNode.onaudioprocess = null; scriptNode = null; }
+        if (silencer) { try { silencer.disconnect(); } catch (e) {} silencer = null; }
+      }
+      if (scriptNode) return;
+
       scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
       silencer = audioCtx.createGain();
       silencer.gain.value = 0.0001;
@@ -599,12 +606,15 @@
       silencer.connect(audioCtx.destination);
 
       scriptNode.onaudioprocess = (e) => {
+        audioProcessFiredCount++;
         if (!isTalking || !client || !client.connected) return;
         const inputData = e.inputBuffer.getChannelData(0);
 
         let sumSq = 0;
         for (let i = 0; i < inputData.length; i++) sumSq += inputData[i] * inputData[i];
         const rms = Math.sqrt(sumSq / inputData.length);
+        if (rms > 0.000001) nonZeroSignalCount++;
+
         const pct = Math.min(100, Math.round(rms * 400));
         $('micMeterFill').style.width = pct + "%";
         $('micMeterPct').innerText = pct + "%";
@@ -650,7 +660,18 @@
       }
     };
 
-    async function enableMicrophone() {
+    // 檢查支咪係咪真係活緊（防止背景喚醒後變成 Zombie Stream）
+    function isMicStreamHealthy() {
+      if (!micStream || !micStream.active) return false;
+      const tracks = micStream.getAudioTracks();
+      if (!tracks.length) return false;
+      const t = tracks[0];
+      return t.readyState === 'live' && !t.muted;
+    }
+
+    async function enableMicrophone(forceRecreateNodes = false) {
+      if (isRebuildingMic) return false;
+      isRebuildingMic = true;
       try {
         if (micSourceNode) { try { micSourceNode.disconnect(); } catch (e) {} micSourceNode = null; }
         if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
@@ -664,25 +685,41 @@
           micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         }
 
+        // 監聽系統背景切斷麥克風事件
+        const track = micStream.getAudioTracks()[0];
+        if (track) {
+          track.onended = () => {
+            micNeedsRefresh = true;
+            setBadge($('micBadge'), "麥克風: 待喚醒重連", "warn");
+          };
+        }
+
         await refreshMicDeviceList();
 
         if (audioCtx) {
-          setupAudioProcessor();
+          await ensureAudioActive();
+          setupAudioProcessor(forceRecreateNodes);
           micSourceNode = audioCtx.createMediaStreamSource(micStream);
           micSourceNode.connect(scriptNode);
         }
 
-        const trackLabel = micStream.getAudioTracks()[0]?.label || "預設裝置";
+        const trackLabel = track?.label || "預設裝置";
         micEnabled = true;
+        micNeedsRefresh = false;
         setBadge($('micBadge'), "麥克風: 就緒", "ok");
         $('toggleMicBtn').innerText = "停止麥克風";
         $('toggleMicBtn').className = "ctrl-btn mic-on";
         $('pttBtn').classList.remove('disabled-mic');
-        $('pttBtn').innerText = "按住通話 (PTT)";
-        $('statusText').innerText = `已啟用: ${trackLabel}`;
+        if (!isTalking) {
+          $('pttBtn').innerText = "按住通話 (PTT)";
+          $('statusText').innerText = `已啟用: ${trackLabel}`;
+        }
+        isRebuildingMic = false;
         return true;
       } catch (err) {
-        $('statusText').innerText = "麥克風授權失敗: " + err.message;
+        setBadge($('micBadge'), "麥克風: 需重連", "warn");
+        $('statusText').innerText = "麥克風重連失敗，請按一下 PTT 重試";
+        isRebuildingMic = false;
         return false;
       }
     }
@@ -692,6 +729,7 @@
       if (micSourceNode) { try { micSourceNode.disconnect(); } catch (e) {} micSourceNode = null; }
       if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
       micEnabled = false;
+      micNeedsRefresh = false;
       setBadge($('micBadge'), "麥克風: 純收聽", "off");
       $('toggleMicBtn').innerText = "重開麥克風";
       $('toggleMicBtn').className = "ctrl-btn mic-off";
@@ -705,7 +743,7 @@
       if (micEnabled) disableMicrophone();
       else {
         $('statusText').innerText = "正在重新連接麥克風...";
-        await enableMicrophone();
+        await enableMicrophone(true);
       }
     };
 
@@ -722,16 +760,52 @@
     }
 
     async function ensureAudioActive() {
-      if (audioCtx && (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted')) {
+      if (!audioCtx) return;
+      if (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') {
         try { await audioCtx.resume(); } catch (e) {}
+      }
+      // 如果 iOS PWA 背景返嚟將 AudioContext 徹底鎖死喺 closed，自動重建一個新嘅
+      if (audioCtx.state === 'closed') {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        rxGainNode = audioCtx.createGain();
+        rxGainNode.gain.value = rxVolume;
+        rxGainNode.connect(audioCtx.destination);
+        scriptNode = null;
+        setupAudioProcessor(true);
       }
     }
 
-    document.addEventListener('visibilitychange', async () => {
-      if (document.visibilityState === 'visible' && audioCtx) {
-        await requestWakeLock();
-        await ensureAudioActive();
-        publishPresence('ping');
+    // 【核心自癒 1】：當 PWA 由背景返到前景時，自動強制換新麥克風 Stream！
+    async function recoverFromBackground() {
+      if (!audioCtx) return;
+      await requestWakeLock();
+      await ensureAudioActive();
+      publishPresence('ping');
+
+      const awayTimeMs = hiddenTimestamp > 0 ? (Date.now() - hiddenTimestamp) : 9999;
+      // 只要離開超過 1.5 秒、或者支咪已經死咗，強制重新攞過支新咪！
+      if (micEnabled && (awayTimeMs > 1500 || micNeedsRefresh || !isMicStreamHealthy())) {
+        $('statusText').innerText = "🔄 由背景返回，正在自動重啟麥克風...";
+        await enableMicrophone(true);
+      }
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        hiddenTimestamp = Date.now();
+        if (isTalking) stopTalking();
+      } else if (document.visibilityState === 'visible') {
+        recoverFromBackground();
+      }
+    });
+
+    window.addEventListener('pageshow', (e) => {
+      if (e.persisted || audioCtx) recoverFromBackground();
+    });
+
+    window.addEventListener('focus', () => {
+      if (audioCtx && micEnabled && (!isMicStreamHealthy() || micNeedsRefresh)) {
+        recoverFromBackground();
       }
     });
 
@@ -750,7 +824,7 @@
       rxGainNode.connect(audioCtx.destination);
       await ensureAudioActive();
 
-      if (!(await enableMicrophone())) {
+      if (!(await enableMicrophone(true))) {
         $('initBtn').disabled = false;
         return;
       }
@@ -842,7 +916,6 @@
         const senderId = view.getUint32(4, true);
         if (senderId === MY_ID) return;
 
-        // 零 Allocation 直接讀取與計算 RMS
         const audioLen = payload.byteLength - 8;
         const srcBytes = new Uint8Array(payload.buffer, payload.byteOffset + 8, audioLen);
         let sumSq = 0;
@@ -952,7 +1025,7 @@
     }
 
     // ====================================================
-    // PTT 發話控制 (修復連撳 Timer 衝突)
+    // PTT 發話控制 (含 0.6s 死咪自動偵測重連 Watchdog)
     // ====================================================
     const pttBtn = $('pttBtn');
     pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startTalking(); });
@@ -980,7 +1053,7 @@
     });
 
     async function startTalking() {
-      if (!micEnabled || !micStream) {
+      if (!micEnabled) {
         $('statusText').innerText = "請先點擊上方「重開麥克風」才可發話！";
         return;
       }
@@ -989,23 +1062,14 @@
       isTalking = true;
       hasSpokenInCurrentPtt = false;
       silentFrameCount = 0;
+      audioProcessFiredCount = 0;
+      nonZeroSignalCount = 0;
       clearTimeout(rxTimeout);
-      clearTimeout(sttStopTimer); // 防止上次放手嘅延遲 Timer 殺死今次嘅語音辨識！
+      clearTimeout(sttStopTimer);
+      clearTimeout(pttWatchdogTimer);
 
       for (const id in peers) peers[id].ackCount = 0;
       renderPresenceList();
-
-      const tracks = micStream.getAudioTracks();
-      tracks.forEach(t => t.enabled = true);
-
-      if (sttEnabled && recognition && !recognitionActive) {
-        currentTranscript = "";
-        try { recognition.start(); } catch (e) {}
-      }
-
-      if (!tracks.length || tracks[0].readyState === 'ended') {
-        await enableMicrophone();
-      }
 
       pttBtn.classList.remove('receiving');
       pttBtn.classList.add('active');
@@ -1013,13 +1077,42 @@
       $('statusText').innerText = "🎙️ 請講話... (正同步傳送語音及字幕)";
 
       await ensureAudioActive();
+
+      // 如果支咪已經唔健康或者標記咗需要刷新，即刻喺用戶手勢內重新攞咪！
+      if (micNeedsRefresh || !isMicStreamHealthy()) {
+        $('statusText').innerText = "🔄 正在喚醒麥克風...";
+        await enableMicrophone(true);
+      } else if (micStream) {
+        micStream.getAudioTracks().forEach(t => t.enabled = true);
+      }
+
       if (!isTalking) return;
+
+      if (sttEnabled && recognition && !recognitionActive) {
+        currentTranscript = "";
+        try { recognition.start(); } catch (e) {}
+      }
+
       playRogerBeep(1500, 45);
+
+      // 【核心自癒 2】：如果撳住 PTT 600ms 後發現 Audio 引擎死寂 (無觸發或全 0 死數據)，即時自動重建！
+      pttWatchdogTimer = setTimeout(async () => {
+        if (!isTalking) return;
+        if (audioProcessFiredCount === 0 || nonZeroSignalCount === 0) {
+          $('statusText').innerText = "⚡ 偵測到背景麥克風休眠，正在自動重啟...";
+          await ensureAudioActive();
+          await enableMicrophone(true);
+          if (isTalking) {
+            $('statusText').innerText = "✅ 麥克風已自動修復！請話題繼續...";
+          }
+        }
+      }, 600);
     }
 
     function stopTalking() {
       if (!isTalking) return;
       isTalking = false;
+      clearTimeout(pttWatchdogTimer);
       $('micMeterFill').style.width = "0%";
       $('micMeterPct').innerText = "0%";
       pttBtn.classList.remove('active');
