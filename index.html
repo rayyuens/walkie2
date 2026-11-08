@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.9 真聲偵測與收聽回執版</title>
+  <title>Web 對講機 - v11.0 字幕與真聲回執終極版</title>
   
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
   <meta name="theme-color" content="#0b0d10">
@@ -181,9 +181,7 @@
       display: none;
     }
 
-    /* =========================================
-       常駐顯眼：在線成員與即時收聽指示面板
-       ========================================= */
+    /* 常駐顯眼：在線成員與即時收聽指示面板 */
     .presence-panel {
       display: none;
       width: 90%;
@@ -264,7 +262,7 @@
       font-weight: bold;
     }
 
-    /* 實時本機咪高峰音量條（一眼睇出隻咪有冇聲） */
+    /* 實時本機咪高峰音量條 */
     .mic-meter-wrap {
       display: none;
       width: 90%;
@@ -427,7 +425,7 @@
       cursor: pointer;
     }
     .debug {
-      margin-top: 10px;
+      margin-top: 8px;
       font-size: 12px;
       color: #00e676;
       font-family: monospace;
@@ -435,11 +433,15 @@
       padding: 6px 12px;
       border-radius: 6px;
       border: 1px solid #262b33;
+      width: 90%;
+      max-width: 400px;
+      box-sizing: border-box;
+      text-align: center;
     }
   </style>
 </head>
 <body>
-  <div class="ver">v10.9 真聲偵測與收聽回執版</div>
+  <div class="ver">v11.0 字幕與真聲回執終極版</div>
   
   <details>
     <summary>📊 系統狀態燈號</summary>
@@ -469,7 +471,7 @@
       </select>
 
       <div class="hint-box" id="pcMicHint">
-        💡 <b>電腦字幕提示</b>：Chrome 語音辨識固定讀取 <b>Windows 系統預設輸入裝置</b>。如對講有聲但無字幕，請在 Windows 右下角喇叭圖示將此麥克風設為「系統預設」。
+        💡 <b>電腦字幕提示</b>：Chrome 語音辨識固定讀取 <b>Windows 系統預設輸入裝置</b>。
       </div>
 
       <div class="pwd-row">
@@ -496,7 +498,7 @@
     </div>
   </div>
 
-  <!-- 實時本機麥克風音量能量條（防止揀錯無聲虛擬咪） -->
+  <!-- 實時本機麥克風音量能量條 -->
   <div class="mic-meter-wrap" id="micMeterWrap">
     <span>🎙️ 本機咪音量:</span>
     <div class="mic-meter-bar-bg">
@@ -520,7 +522,7 @@
     <button id="manualSubBtn" class="manual-sub-btn">發送</button>
   </div>
 
-  <div class="debug" id="debugText">本機 ID: ---- | TX: 0 | RX: 0</div>
+  <div class="debug" id="debugText">ID: ---- | 語音TX: 0 | 語音RX: 0 | 字幕TX: 0</div>
 
   <script>
     const MQTT_BROKER = "wss://broker.hivemq.com:8884/mqtt";
@@ -537,7 +539,7 @@
     const IS_EDGE = /Edg\//i.test(navigator.userAgent);
     const MY_DEV_ICON = IS_MOBILE ? "📱" : "💻";
 
-    // 真聲能量門檻（過濾 Steam Streaming Mic 等虛擬靜音訊號）
+    // 真聲能量門檻（過濾虛擬靜音訊號）
     const VOICE_RMS_THRESHOLD = 0.008;
 
     let client = null;
@@ -555,12 +557,11 @@
     let isTalking = false;
     let hasSpokenInCurrentPtt = false;
     let silentFrameCount = 0;
-    let sttCaptureWindow = false;
-    let sttWindowTimer = null;
     let nextStartTime = 0;
     let lastSample = 0;
     let txCount = 0;
     let rxCount = 0;
+    let subTxCount = 0;
     let rxTimeout = null;
 
     // 在線成員與收聽回執追蹤
@@ -577,7 +578,6 @@
     let sttEnabled = true;
     let currentTranscript = "";
     let recognitionActive = false;
-    let resultIndexOffset = 0;
 
     const initBtn = document.getElementById('initBtn');
     const pttBtn = document.getElementById('pttBtn');
@@ -624,8 +624,13 @@
       return h >>> 0;
     }
 
+    function updateDebug() {
+      debugText.innerText = `ID: ${MY_ID_HEX} | 語音TX: ${txCount} | 語音RX: ${rxCount} | 字幕TX: ${subTxCount}`;
+    }
+    updateDebug();
+
     // ====================================================
-    // 在線成員列表 & 真實收聽回執 (RX ACK) 核心邏輯
+    // 在線成員列表 & 真實收聽回執 (RX ACK)
     // ====================================================
     function sendPresencePing() {
       if (!client || !client.connected) return;
@@ -707,9 +712,9 @@
         if (hearingMeCount > 0) {
           statusText.innerText = `✅ 對方正清晰收到你把聲！(${hearingMeCount} 人收聽中)`;
         } else if (!hasSpokenInCurrentPtt && silentFrameCount > 8) {
-          statusText.innerText = `⚠️ 麥克風無聲音輸入 (0%)！請檢查有冇揀錯虛擬咪`;
+          statusText.innerText = `⚠️ 麥克風無聲音輸入 (0%)！請對住咪講話或檢查裝置`;
         } else {
-          statusText.innerText = `📡 正在廣播語音... (等待對方回執)`;
+          statusText.innerText = `📡 正在廣播語音及字幕...`;
         }
       }
     }
@@ -821,14 +826,12 @@
       return (~(sign | (exp << 4) | mant)) & 0xFF;
     }
 
-    function updateDebug() {
-      debugText.innerText = `ID: ${MY_ID_HEX} | 發送(TX): ${txCount} | 接收(RX): ${rxCount}`;
-    }
-    updateDebug();
-
+    // ====================================================
+    // Google 官方 Demo 對齊版：單次觸發、零 Offset 攔截語音辨識
+    // ====================================================
     function initSpeechRecognition() {
       if (!SpeechRecognition) {
-        sttBadge.innerText = "粵語字幕: 瀏覽器不支援(請用Chrome)";
+        sttBadge.innerText = "粵語字幕: 瀏覽器不支援";
         sttBadge.className = "badge off";
         toggleSttBtn.style.display = 'none';
         return;
@@ -836,56 +839,52 @@
 
       recognition = new SpeechRecognition();
       recognition.lang = 'zh-HK';
-      recognition.continuous = true;
+      recognition.continuous = false; // 對齊 Google Demo：按住講完一句即結算，杜絕背景死鎖
       recognition.interimResults = true;
 
       recognition.onstart = () => {
         recognitionActive = true;
-        resultIndexOffset = 0;
-        sttBadge.innerText = isTalking ? "粵語字幕: 🎙️聽寫中..." : "粵語字幕: 預熱待命";
+        sttBadge.innerText = "粵語字幕: 🎙️聽寫中...";
         sttBadge.className = "badge ok";
       };
 
       recognition.onspeechstart = () => {
-        if (isTalking) {
-          sttBadge.innerText = "粵語字幕: 🗣️偵測到說話!";
-          sttBadge.className = "badge ok";
-        }
+        sttBadge.innerText = "粵語字幕: 🗣️偵測到說話!";
+        sttBadge.className = "badge ok";
       };
 
       recognition.onresult = (event) => {
-        if (!isTalking && !sttCaptureWindow) {
-          resultIndexOffset = event.results.length;
-          return;
-        }
-
         let interim = "";
         let finalStr = "";
-        const startIdx = Math.min(resultIndexOffset, event.results.length);
-        for (let i = startIdx; i < event.results.length; i++) {
+        for (let i = 0; i < event.results.length; i++) {
           const res = event.results[i];
-          const transcript = res[0].transcript;
           if (res.isFinal) {
-            finalStr += transcript;
+            finalStr += res[0].transcript;
           } else {
-            interim += transcript;
+            interim += res[0].transcript;
           }
         }
-        currentTranscript = (finalStr + interim).trim();
-        if (currentTranscript) {
+        const text = (finalStr + interim).trim();
+        if (text) {
+          currentTranscript = text;
+          const isFinalResult = finalStr.length > 0 && interim.length === 0;
           sttBadge.innerText = "粵語字幕: ✅已輸出字幕";
           sttBadge.className = "badge ok";
-          upsertChatMessage(MY_ID_HEX, currentTranscript, false, true);
-          publishTextSubtitle(currentTranscript, false);
+          upsertChatMessage(MY_ID_HEX, currentTranscript, isFinalResult, true);
+          publishTextSubtitle(currentTranscript, isFinalResult);
+          if (isFinalResult) {
+            currentTranscript = "";
+          }
         }
       };
 
       recognition.onerror = (e) => {
+        console.warn("STT Error:", e.error);
         if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
           sttBadge.innerText = "粵語字幕: 權限被拒";
           sttBadge.className = "badge off";
         } else if (e.error === 'network') {
-          sttBadge.innerText = IS_EDGE ? "粵語字幕: Edge不支援(請用Chrome)" : "粵語字幕: 網絡阻擋";
+          sttBadge.innerText = IS_EDGE ? "粵語字幕: 請用Chrome" : "粵語字幕: 網絡錯誤";
           sttBadge.className = "badge off";
         } else if (e.error === 'audio-capture') {
           sttBadge.innerText = "粵語字幕: 找不到系統預設咪";
@@ -895,17 +894,15 @@
 
       recognition.onend = () => {
         recognitionActive = false;
-        if (currentTranscript && (isTalking || sttCaptureWindow)) {
+        // 如果放手時仲有未標記為 final 嘅 interim 字串，強制發送埋出去
+        if (currentTranscript) {
           upsertChatMessage(MY_ID_HEX, currentTranscript, true, true);
           publishTextSubtitle(currentTranscript, true);
           currentTranscript = "";
         }
-        if (sttEnabled && micEnabled && (!IS_MOBILE || isTalking)) {
-          setTimeout(() => {
-            if (sttEnabled && micEnabled && !recognitionActive && (!IS_MOBILE || isTalking)) {
-              try { recognition.start(); } catch (err) {}
-            }
-          }, 150);
+        // 如果用家仲長按緊 PTT 講緊長句，立即無縫重啟下一輪聽寫
+        if (isTalking && sttEnabled && micEnabled) {
+          try { recognition.start(); } catch (err) {}
         } else if (sttEnabled) {
           sttBadge.innerText = "粵語字幕: 就緒";
           sttBadge.className = "badge ok";
@@ -914,10 +911,6 @@
 
       sttBadge.innerText = "粵語字幕: 就緒";
       sttBadge.className = "badge ok";
-
-      if (!IS_MOBILE && sttEnabled) {
-        try { recognition.start(); } catch (e) {}
-      }
     }
 
     function publishTextSubtitle(text, isFinal) {
@@ -929,6 +922,8 @@
         final: isFinal
       });
       client.publish(currentTextTopic, payload, { qos: 0 });
+      subTxCount++;
+      updateDebug();
     }
 
     function upsertChatMessage(senderHex, text, isFinal, isMe) {
@@ -973,9 +968,6 @@
         toggleSttBtn.className = "ctrl-btn stt-on";
         sttBadge.innerText = "粵語字幕: 就緒";
         sttBadge.className = "badge ok";
-        if (!IS_MOBILE && recognition && !recognitionActive) {
-          try { recognition.start(); } catch (e) {}
-        }
       } else {
         if (recognition && recognitionActive) {
           try { recognition.stop(); } catch (e) {}
@@ -1255,7 +1247,7 @@
         if (topic === currentTextTopic) {
           try {
             const data = JSON.parse(new TextDecoder().decode(payload));
-            if (data.sender && data.sender !== MY_ID_HEX && data.text) {
+            if (data.magic === currentMagic && data.sender && data.sender !== MY_ID_HEX && data.text) {
               upsertChatMessage(data.sender, data.text, data.final, false);
             }
           } catch (e) {}
@@ -1281,8 +1273,7 @@
           audioBytes.set(srcBytes);
         }
 
-        // 【關鍵修復】：檢查接收端音訊能量 (RMS Volume)
-        // 如果對方揀錯 Steam Mic 發送純靜音，RMS 會低過門檻，直接忽略唔回傳 ACK！
+        // 檢查接收端音訊能量 (RMS Volume)，過濾無聲虛擬咪封包
         let sumSq = 0;
         for (let i = 0; i < audioLen; i++) {
           const s = ULAW_DECODE[audioBytes[i]];
@@ -1441,8 +1432,6 @@
       isTalking = true;
       hasSpokenInCurrentPtt = false;
       silentFrameCount = 0;
-      sttCaptureWindow = true;
-      clearTimeout(sttWindowTimer);
       currentTranscript = "";
 
       for (const id in peers) {
@@ -1450,26 +1439,26 @@
       }
       renderPresenceList();
 
-      if (sttEnabled && recognition) {
-        sttBadge.innerText = "粵語字幕: 🎙️聽寫中...";
-        sttBadge.className = "badge ok";
-        if (!recognitionActive) {
-          try { recognition.start(); } catch (e) {}
-        }
+      const tracks = micStream.getAudioTracks();
+      for (let i = 0; i < tracks.length; i++) {
+        tracks[i].enabled = true;
       }
 
-      const tracks = micStream.getAudioTracks();
+      // 【關鍵】：0ms 同步啟動單次語音辨識（完全對齊 Google 官方 Demo）
+      if (sttEnabled && recognition && !recognitionActive) {
+        try {
+          recognition.start();
+        } catch (e) {}
+      }
+
       if (tracks.length === 0 || tracks[0].readyState === 'ended') {
         await enableMicrophone();
-      }
-      for (let i = 0; i < micStream.getAudioTracks().length; i++) {
-        micStream.getAudioTracks()[i].enabled = true;
       }
 
       pttBtn.classList.remove('receiving');
       pttBtn.classList.add('active');
       pttBtn.innerText = "正在廣播中...";
-      statusText.innerText = "🎙️ 請講話... (正偵測麥克風音量)";
+      statusText.innerText = "🎙️ 請講話... (正同步傳送語音及字幕)";
 
       await ensureAudioActive();
       if (!isTalking) return;
@@ -1487,7 +1476,6 @@
         if (!isTalking || !client.connected) return;
         const inputData = e.inputBuffer.getChannelData(0);
 
-        // 計算本機麥克風輸入音量 (RMS)
         let sumSq = 0;
         for (let i = 0; i < inputData.length; i++) {
           sumSq += inputData[i] * inputData[i];
@@ -1497,7 +1485,6 @@
         micMeterFill.style.width = pct + "%";
         micMeterPct.innerText = pct + "%";
 
-        // 發送端雙重把關：如果隻咪完全無聲 (低過門檻)，唔發送空包出去！
         if (rms * 2.4 < VOICE_RMS_THRESHOLD) {
           silentFrameCount++;
           if (!hasSpokenInCurrentPtt && silentFrameCount === 10) {
@@ -1542,18 +1529,14 @@
 
       playRogerBeep(1050, 60);
 
-      clearTimeout(sttWindowTimer);
-      sttWindowTimer = setTimeout(() => {
-        sttCaptureWindow = false;
-        if (currentTranscript) {
-          upsertChatMessage(MY_ID_HEX, currentTranscript, true, true);
-          publishTextSubtitle(currentTranscript, true);
-          currentTranscript = "";
+      // 放開 PTT 後延遲 350ms 呼叫 stop()，等尾音完整進入 Google 辨識引擎並自動觸發 onresult / onend
+      setTimeout(() => {
+        if (!isTalking && recognition && recognitionActive) {
+          try {
+            recognition.stop();
+          } catch (e) {}
         }
-        if (recognition && recognitionActive) {
-          try { recognition.stop(); } catch (e) {}
-        }
-      }, 700);
+      }, 350);
     }
   </script>
 </body>
