@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Web 對講機 - v10.8 在線成員與收聽回執版</title>
+  <title>Web 對講機 - v10.9 真聲偵測與收聽回執版</title>
   
   <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Web%20%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22short_name%22%3A%22%E5%B0%8D%E8%AC%9B%E6%A9%9F%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230b0d10%22%2C%22theme_color%22%3A%22%230b0d10%22%7D">
   <meta name="theme-color" content="#0b0d10">
@@ -192,7 +192,7 @@
       border: 1px solid #2c3540;
       border-radius: 10px;
       padding: 8px 10px;
-      margin-bottom: 10px;
+      margin-bottom: 8px;
       box-sizing: border-box;
     }
     .presence-header {
@@ -238,7 +238,6 @@
       background: #00e676;
       box-shadow: 0 0 6px #00e676;
     }
-    /* 當對方正收到你把聲時：強螢光綠顯眼提示 */
     .peer-chip.hearing {
       background: rgba(0, 230, 118, 0.22);
       border-color: #00e676;
@@ -250,7 +249,6 @@
       background: #ffff00;
       box-shadow: 0 0 8px #ffff00;
     }
-    /* 當對方正在講嘢時：藍色提示 */
     .peer-chip.speaking {
       background: rgba(0, 229, 255, 0.18);
       border-color: #00e5ff;
@@ -266,8 +264,45 @@
       font-weight: bold;
     }
 
+    /* 實時本機咪高峰音量條（一眼睇出隻咪有冇聲） */
+    .mic-meter-wrap {
+      display: none;
+      width: 90%;
+      max-width: 400px;
+      background: #14171d;
+      border: 1px solid #262b33;
+      border-radius: 8px;
+      padding: 6px 10px;
+      margin-bottom: 8px;
+      box-sizing: border-box;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #90a4ae;
+    }
+    .mic-meter-bar-bg {
+      flex: 1;
+      height: 8px;
+      background: #1c2026;
+      border-radius: 4px;
+      overflow: hidden;
+      border: 1px solid #2c323b;
+    }
+    .mic-meter-bar-fill {
+      width: 0%;
+      height: 100%;
+      background: linear-gradient(90deg, #00e676, #ffea00, #ff1744);
+      transition: width 0.06s linear;
+    }
+    .mic-meter-pct {
+      min-width: 34px;
+      text-align: right;
+      font-family: monospace;
+      color: #00e676;
+    }
+
     .status {
-      margin-bottom: 10px;
+      margin-bottom: 8px;
       font-size: 14px;
       color: #cfd8dc;
       padding: 0 20px;
@@ -326,7 +361,7 @@
       display: none;
       width: 90%;
       max-width: 400px;
-      height: 155px;
+      height: 150px;
       margin-top: 12px;
       background: #14171d;
       border: 1px solid #262b33;
@@ -404,7 +439,7 @@
   </style>
 </head>
 <body>
-  <div class="ver">v10.8 在線成員與收聽回執版</div>
+  <div class="ver">v10.9 真聲偵測與收聽回執版</div>
   
   <details>
     <summary>📊 系統狀態燈號</summary>
@@ -450,7 +485,7 @@
     </div>
   </details>
 
-  <!-- 唔放入摺疊選單，直接擺喺主畫面最顯眼位置！ -->
+  <!-- 常駐顯眼：在線成員與即時收聽指示面板 -->
   <div class="presence-panel" id="presencePanel">
     <div class="presence-header">
       <span id="onlineCountLabel">👥 頻道在線成員 (0 人)</span>
@@ -459,6 +494,15 @@
     <div class="presence-list" id="presenceList">
       <div class="peer-empty">⏳ 正在搜尋同頻道嘅在線用家...</div>
     </div>
+  </div>
+
+  <!-- 實時本機麥克風音量能量條（防止揀錯無聲虛擬咪） -->
+  <div class="mic-meter-wrap" id="micMeterWrap">
+    <span>🎙️ 本機咪音量:</span>
+    <div class="mic-meter-bar-bg">
+      <div class="mic-meter-bar-fill" id="micMeterFill"></div>
+    </div>
+    <span class="mic-meter-pct" id="micMeterPct">0%</span>
   </div>
 
   <div class="status" id="statusText">請點擊下方按鈕啟動對講機</div>
@@ -493,6 +537,9 @@
     const IS_EDGE = /Edg\//i.test(navigator.userAgent);
     const MY_DEV_ICON = IS_MOBILE ? "📱" : "💻";
 
+    // 真聲能量門檻（過濾 Steam Streaming Mic 等虛擬靜音訊號）
+    const VOICE_RMS_THRESHOLD = 0.008;
+
     let client = null;
     let audioCtx = null;
     let rxGainNode = null;
@@ -506,6 +553,8 @@
     let wakeLock = null;
     let keepAliveTimer = null;
     let isTalking = false;
+    let hasSpokenInCurrentPtt = false;
+    let silentFrameCount = 0;
     let sttCaptureWindow = false;
     let sttWindowTimer = null;
     let nextStartTime = 0;
@@ -556,6 +605,9 @@
     const presenceList = document.getElementById('presenceList');
     const onlineCountLabel = document.getElementById('onlineCountLabel');
     const myIdBanner = document.getElementById('myIdBanner');
+    const micMeterWrap = document.getElementById('micMeterWrap');
+    const micMeterFill = document.getElementById('micMeterFill');
+    const micMeterPct = document.getElementById('micMeterPct');
 
     myIdBanner.innerText = `${MY_DEV_ICON}${MY_ID_HEX}`;
 
@@ -589,7 +641,6 @@
     function sendRxAck(speakerHex) {
       if (!client || !client.connected) return;
       const now = Date.now();
-      // 每 350ms 最多回傳一次 ACK，避免塞爆 MQTT
       if (now - lastAckSentTime < 350) return;
       lastAckSentTime = now;
       const payload = JSON.stringify({
@@ -655,6 +706,8 @@
       if (isTalking) {
         if (hearingMeCount > 0) {
           statusText.innerText = `✅ 對方正清晰收到你把聲！(${hearingMeCount} 人收聽中)`;
+        } else if (!hasSpokenInCurrentPtt && silentFrameCount > 8) {
+          statusText.innerText = `⚠️ 麥克風無聲音輸入 (0%)！請檢查有冇揀錯虛擬咪`;
         } else {
           statusText.innerText = `📡 正在廣播語音... (等待對方回執)`;
         }
@@ -1152,6 +1205,7 @@
         initBtn.style.display = 'none';
         controlsDetails.style.display = 'block';
         presencePanel.style.display = 'block';
+        micMeterWrap.style.display = 'flex';
         pttBtn.style.display = 'block';
         chatBox.style.display = 'block';
         manualSubRow.style.display = 'flex';
@@ -1188,7 +1242,6 @@
             peers[data.sender].lastSeen = now;
             if (data.dev) peers[data.sender].dev = data.dev;
 
-            // 如果對方發送 ACK 目標係我，代表對方真係收到並播放緊我把聲！
             if (data.type === 'ack' && data.target === MY_ID_HEX) {
               peers[data.sender].lastAck = now;
               peers[data.sender].ackCount = (peers[data.sender].ackCount || 0) + 1;
@@ -1217,11 +1270,33 @@
         const senderId = view.getUint32(4, true);
         if (senderId === MY_ID) return;
 
+        const audioLen = payload.byteLength - 8;
+        const audioBytes = new Uint8Array(audioLen);
+        const srcBytes = new Uint8Array(payload.buffer, payload.byteOffset + 8, audioLen);
+        if (cipherMask) {
+          for (let i = 0; i < audioLen; i++) {
+            audioBytes[i] = srcBytes[i] ^ cipherMask[i & 63];
+          }
+        } else {
+          audioBytes.set(srcBytes);
+        }
+
+        // 【關鍵修復】：檢查接收端音訊能量 (RMS Volume)
+        // 如果對方揀錯 Steam Mic 發送純靜音，RMS 會低過門檻，直接忽略唔回傳 ACK！
+        let sumSq = 0;
+        for (let i = 0; i < audioLen; i++) {
+          const s = ULAW_DECODE[audioBytes[i]];
+          sumSq += s * s;
+        }
+        const rxRms = Math.sqrt(sumSq / audioLen);
+        if (rxRms < VOICE_RMS_THRESHOLD) {
+          return;
+        }
+
         const senderHex = senderId.toString(16).toUpperCase().padStart(8, '0').slice(0, 4);
         rxCount++;
         updateDebug();
 
-        // 更新發話者狀態並立即發送「收聽回執 (ACK)」畀對方
         const now = Date.now();
         if (!peers[senderHex]) {
           peers[senderHex] = { dev: '👤', lastSeen: now, lastAck: 0, lastSpeak: now, ackCount: 0 };
@@ -1259,16 +1334,6 @@
           }
         }, 350);
 
-        const audioLen = payload.byteLength - 8;
-        const audioBytes = new Uint8Array(audioLen);
-        const srcBytes = new Uint8Array(payload.buffer, payload.byteOffset + 8, audioLen);
-        if (cipherMask) {
-          for (let i = 0; i < audioLen; i++) {
-            audioBytes[i] = srcBytes[i] ^ cipherMask[i & 63];
-          }
-        } else {
-          audioBytes.set(srcBytes);
-        }
         playIncomingUlaw(audioBytes);
       });
     };
@@ -1374,11 +1439,12 @@
       if (!client || !client.connected || isTalking) return;
 
       isTalking = true;
+      hasSpokenInCurrentPtt = false;
+      silentFrameCount = 0;
       sttCaptureWindow = true;
       clearTimeout(sttWindowTimer);
       currentTranscript = "";
 
-      // 每次撳 PTT 重置今次講話嘅 ACK 計數器，方便睇清楚呢句嘢對方收到幾多包
       for (const id in peers) {
         peers[id].ackCount = 0;
       }
@@ -1403,7 +1469,7 @@
       pttBtn.classList.remove('receiving');
       pttBtn.classList.add('active');
       pttBtn.innerText = "正在廣播中...";
-      statusText.innerText = "📡 正在發送語音... (請睇上方成員燈號)";
+      statusText.innerText = "🎙️ 請講話... (正偵測麥克風音量)";
 
       await ensureAudioActive();
       if (!isTalking) return;
@@ -1420,6 +1486,27 @@
       scriptNode.onaudioprocess = (e) => {
         if (!isTalking || !client.connected) return;
         const inputData = e.inputBuffer.getChannelData(0);
+
+        // 計算本機麥克風輸入音量 (RMS)
+        let sumSq = 0;
+        for (let i = 0; i < inputData.length; i++) {
+          sumSq += inputData[i] * inputData[i];
+        }
+        const rms = Math.sqrt(sumSq / inputData.length);
+        const pct = Math.min(100, Math.round(rms * 400));
+        micMeterFill.style.width = pct + "%";
+        micMeterPct.innerText = pct + "%";
+
+        // 發送端雙重把關：如果隻咪完全無聲 (低過門檻)，唔發送空包出去！
+        if (rms * 2.4 < VOICE_RMS_THRESHOLD) {
+          silentFrameCount++;
+          if (!hasSpokenInCurrentPtt && silentFrameCount === 10) {
+            renderPresenceList();
+          }
+          return;
+        }
+
+        hasSpokenInCurrentPtt = true;
         const packet = encodeAudioPacket(inputData, audioCtx.sampleRate);
         client.publish(currentTopic, packet, { qos: 0 });
         txCount++;
@@ -1434,6 +1521,8 @@
     function stopTalking() {
       if (!isTalking) return;
       isTalking = false;
+      micMeterFill.style.width = "0%";
+      micMeterPct.innerText = "0%";
       pttBtn.classList.remove('active');
       pttBtn.innerText = micEnabled ? "按住通話 (PTT)" : "純收聽模式\n(已關閉麥克風)";
       statusText.innerText = "通話結束，放開收聽中";
