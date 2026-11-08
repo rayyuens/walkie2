@@ -1034,24 +1034,6 @@
     pttBtn.addEventListener('mousedown', (e) => { if (e.button === 0) { e.preventDefault(); startTalking(); } });
     window.addEventListener('mouseup', () => { if (isTalking) stopTalking(); });
 
-    window.addEventListener('keydown', (e) => {
-      if (e.code === 'Space' && !e.repeat &&
-          document.activeElement !== $('channelPasswordInput') &&
-          document.activeElement !== $('manualSubInput') &&
-          pttBtn.style.display === 'block') {
-        e.preventDefault();
-        startTalking();
-      }
-    });
-    window.addEventListener('keyup', (e) => {
-      if (e.code === 'Space' && isTalking &&
-          document.activeElement !== $('channelPasswordInput') &&
-          document.activeElement !== $('manualSubInput')) {
-        e.preventDefault();
-        stopTalking();
-      }
-    });
-
     async function startTalking() {
       if (!micEnabled) {
         $('statusText').innerText = "請先點擊上方「重開麥克風」才可發話！";
